@@ -1,0 +1,79 @@
+server:
+  host: 127.0.0.1
+  port: 3050
+
+auth:
+  mode: static-token
+  tokens:
+    - name: local-agent
+      tokenEnv: TOOL_BOUNDARY_AGENT_TOKEN
+      scopes:
+        - tools:read
+        - tools:call
+
+audit:
+  sink: jsonl
+  path: .tool-boundary/audit.jsonl
+  defaults:
+    input: hash
+    output: summary
+    error: summary
+    redactPaths:
+      - /password
+      - /token
+      - /secret
+      - /authorization
+
+policies:
+  default:
+    allowedModes: [read, draft, dryRun]
+  allow-mutating-approved:
+    allowedModes: [read, draft, dryRun, mutate]
+    requireApprovalForModes: [mutate]
+    requireIdempotencyForModes: [mutate]
+
+tools:
+  admin.searchUsers:
+    mode: read
+    riskLevel: low
+    description: Search users by query and status.
+    inputSchema:
+      type: object
+    outputSchema:
+      type: object
+    target:
+      type: http
+      method: POST
+      url: http://localhost:4001/tools/admin.searchUsers
+    audit:
+      input: hash
+      output: summary
+      error: summary
+
+  admin.disableUser:
+    mode: mutate
+    riskLevel: high
+    approvalRequired: true
+    description: Disable a user account after operator approval.
+    inputSchema:
+      type: object
+      required: [userId]
+      properties:
+        userId:
+          type: string
+    outputSchema:
+      type: object
+    target:
+      type: http
+      method: POST
+      url: http://localhost:4001/tools/admin.disableUser
+      timeoutMs: 5000
+    policy: allow-mutating-approved
+    idempotency:
+      required: true
+    audit:
+      input: hash
+      output: summary
+      error: summary
+      redactPaths:
+        - /reason

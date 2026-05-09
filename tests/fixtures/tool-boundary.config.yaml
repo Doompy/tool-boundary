@@ -1,0 +1,53 @@
+server:
+  host: 127.0.0.1
+  port: 3050
+
+auth:
+  mode: static-token
+  tokens:
+    - name: local-agent
+      tokenEnv: TOOL_BOUNDARY_AGENT_TOKEN
+      scopes:
+        - tools:read
+        - tools:call
+
+audit:
+  sink: jsonl
+  path: .tool-boundary/audit.jsonl
+  defaults:
+    input: hash
+    output: summary
+    error: summary
+    redactPaths:
+      - /password
+      - /token
+      - /secret
+      - /authorization
+
+policies:
+  default:
+    allowedModes: [read, draft, dryRun]
+  allow-mutating-approved:
+    allowedModes: [read, draft, dryRun, mutate]
+    requireApprovalForModes: [mutate]
+    requireIdempotencyForModes: [mutate]
+
+tools:
+  admin.searchUsers:
+    mode: read
+    riskLevel: low
+    description: Search users by query and status.
+    inputSchema:
+      type: object
+    outputSchema:
+      type: object
+    target:
+      type: mock
+      result:
+        users:
+          - id: usr_123
+            email: ada@example.com
+    audit:
+      input: hash
+      output: summary
+      error: summary

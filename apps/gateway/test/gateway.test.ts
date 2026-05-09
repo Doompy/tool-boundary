@@ -1,0 +1,269 @@
+import { mkdtemp, readFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import Fastify from 'fastify';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import type { LoadedConfig } from '@tool-boundary/config';
+import { createGatewayServer } from '../src/index.js';
+
+const token = 'local-token';
+
+let upstream: ReturnType<typeof Fastify> | undefined;
+let upstreamUrl: string;
+
+beforeEach(async () => {
+  upstream = Fastify({ logger: false });
+  upstream.post('/tools/admin.searchUsers', async () => ({ users: [{ id: 'usr_123' }] }));
+  upstream.post('/tools/admin.disableUser', async (request) => ({ disabled: true, input: request.body }));
+  upstream.post('/tools/secrets.echo', async (request) => request.body);
+  upstream.post('/tools/slow', async () => {
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    return { ok: true };
+  });
+  upstream.post('/tools/error', async (_request, reply) => {
+    await reply.code(500).send({ error: 'fixture failure' });
+  });
+  await upstream.listen({ host: '127.0.0.1', port: 0 });
+  const address = upstream.server.address();
+  if (address === null || typeof address === 'string') throw new Error('Failed to bind upstream fixture');
+  upstreamUrl = `http://127.0.0.1:${address.port}`;
+});
+
+afterEach(async () => {
+  await upstream?.close();
+});
+
+describe('gateway', () => {
+  it('serves health, tools, and read tool calls', async () => {
+    const app = createGatewayServer(await testConfig());
+    expect((await app.inject({ method: 'GET', url: '/healthz' })).statusCode).toBe(200);
+    const tools = await app.inject({ method: 'GET', url: '/v1/tools', headers: authHeaders() });
+    expect(tools.statusCode).toBe(200);
+    expect(JSON.stringify(tools.json())).not.toContain('authorization');
+
+    const call = await app.inject({
+      method: 'POST',
+      url: '/v1/tools/admin.searchUsers/call',
+      headers: authHeaders(),
+      payload: { input: { query: 'ada' } }
+    });
+    expect(call.statusCode).toBe(200);
+    expect(call.json()).toMatchObject({ ok: true, toolName: 'admin.searchUsers' });
+  });
+
+  it('requires approval and idempotency for mutating tools, then consumes approval once', async () => {
+    const app = createGatewayServer(await testConfig());
+    const requested = await app.inject({
+      method: 'POST',
+      url: '/v1/tools/admin.disableUser/call',
+      headers: authHeaders(),
+      payload: { input: { userId: 'usr_123', reason: 'contains-secret-reason' } }
+    });
+    expect(requested.statusCode).toBe(400);
+    const approvalId = requested.json().error.details.approvalId as string;
+
+    const approved = await app.inject({
+      method: 'POST',
+      url: `/v1/approvals/${approvalId}/approve`,
+      headers: authHeaders(),
+      payload: {}
+    });
+    expect(approved.statusCode).toBe(200);
+    const approvalToken = approved.json().approvalToken as string;
+
+    const missingKey = await app.inject({
+      method: 'POST',
+      url: '/v1/tools/admin.disableUser/call',
+      headers: authHeaders(),
+      payload: { approvalToken, input: { userId: 'usr_123', reason: 'contains-secret-reason' } }
+    });
+    expect(missingKey.statusCode).toBe(400);
+    expect(missingKey.json().error.code).toBe('IDEMPOTENCY_KEY_REQUIRED');
+
+    const executed = await app.inject({
+      method: 'POST',
+      url: '/v1/tools/admin.disableUser/call',
+      headers: authHeaders(),
+      payload: {
+        approvalToken,
+        idempotencyKey: 'disable-usr-123',
+        input: { userId: 'usr_123', reason: 'contains-secret-reason' }
+      }
+    });
+    expect(executed.statusCode).toBe(200);
+    expect(executed.json()).toMatchObject({ ok: true, approvalId });
+
+    const consumed = await app.inject({
+      method: 'POST',
+      url: '/v1/tools/admin.disableUser/call',
+      headers: authHeaders(),
+      payload: {
+        approvalToken,
+        idempotencyKey: 'disable-usr-123-again',
+        input: { userId: 'usr_123', reason: 'contains-secret-reason' }
+      }
+    });
+    expect(consumed.statusCode).toBe(400);
+    expect(consumed.json().error.code).toBe('APPROVAL_ALREADY_CONSUMED');
+  });
+
+  it('does not write raw approval tokens or configured secret fields to audit JSONL', async () => {
+    const config = await testConfig();
+    const app = createGatewayServer(config);
+    const requested = await app.inject({
+      method: 'POST',
+      url: '/v1/tools/admin.disableUser/call',
+      headers: authHeaders(),
+      payload: { input: { userId: 'usr_123', reason: 'do-not-leak' } }
+    });
+    const approvalId = requested.json().error.details.approvalId as string;
+    const approved = await app.inject({ method: 'POST', url: `/v1/approvals/${approvalId}/approve`, headers: authHeaders(), payload: {} });
+    const approvalToken = approved.json().approvalToken as string;
+    await app.inject({
+      method: 'POST',
+      url: '/v1/tools/admin.disableUser/call',
+      headers: authHeaders(),
+      payload: {
+        approvalToken,
+        idempotencyKey: 'audit-key',
+        input: { userId: 'usr_123', reason: 'do-not-leak' }
+      }
+    });
+    await app.inject({
+      method: 'POST',
+      url: '/v1/tools/secrets.echo/call',
+      headers: authHeaders(),
+      payload: { input: { secret: 'super-secret', value: true } }
+    });
+
+    const audit = await readFile(join(config.configDir, '.tool-boundary', 'audit.jsonl'), 'utf8');
+    expect(audit).not.toContain(approvalToken);
+    expect(audit).not.toContain('do-not-leak');
+    expect(audit).not.toContain('super-secret');
+  });
+
+  it('maps upstream timeout and error responses', async () => {
+    const app = createGatewayServer(await testConfig());
+    const timeout = await app.inject({
+      method: 'POST',
+      url: '/v1/tools/fixture.slow/call',
+      headers: authHeaders(),
+      payload: { input: {} }
+    });
+    expect(timeout.statusCode).toBe(504);
+    expect(timeout.json().error.code).toBe('TOOL_UPSTREAM_TIMEOUT');
+
+    const error = await app.inject({
+      method: 'POST',
+      url: '/v1/tools/fixture.error/call',
+      headers: authHeaders(),
+      payload: { input: {} }
+    });
+    expect(error.statusCode).toBe(502);
+    expect(error.json().error.code).toBe('TOOL_UPSTREAM_ERROR');
+  });
+
+  it('detects idempotency conflicts', async () => {
+    const app = createGatewayServer(await testConfig());
+    const first = await app.inject({
+      method: 'POST',
+      url: '/v1/tools/admin.searchUsers/call',
+      headers: authHeaders(),
+      payload: { idempotencyKey: 'read-key', input: { query: 'ada' } }
+    });
+    expect(first.statusCode).toBe(200);
+
+    const second = await app.inject({
+      method: 'POST',
+      url: '/v1/tools/admin.searchUsers/call',
+      headers: authHeaders(),
+      payload: { idempotencyKey: 'read-key', input: { query: 'grace' } }
+    });
+    expect(second.statusCode).toBe(400);
+    expect(second.json().error.code).toBe('IDEMPOTENCY_CONFLICT');
+  });
+});
+
+async function testConfig(): Promise<LoadedConfig> {
+  const dir = await mkdtemp(join(tmpdir(), 'tool-boundary-gateway-'));
+  return {
+    server: { host: '127.0.0.1', port: 3050 },
+    auth: {
+      mode: 'static-token',
+      tokens: [{ name: 'local-agent', tokenEnv: 'TOOL_BOUNDARY_AGENT_TOKEN', token, scopes: ['tools:read', 'tools:call'] }]
+    },
+    audit: {
+      sink: 'jsonl',
+      path: '.tool-boundary/audit.jsonl',
+      defaults: {
+        input: 'hash',
+        output: 'summary',
+        error: 'summary',
+        redactPaths: ['/secret', '/token', '/authorization']
+      }
+    },
+    policies: {
+      default: { allowedModes: ['read', 'draft', 'dryRun'] },
+      allowMutatingApproved: {
+        allowedModes: ['read', 'draft', 'dryRun', 'mutate'],
+        requireApprovalForModes: ['mutate'],
+        requireIdempotencyForModes: ['mutate']
+      }
+    },
+    tools: {
+      'admin.searchUsers': {
+        name: 'admin.searchUsers',
+        mode: 'read',
+        description: 'Search users',
+        target: { type: 'http', method: 'POST', url: `${upstreamUrl}/tools/admin.searchUsers`, headers: { authorization: 'Bearer upstream-secret' } },
+        audit: { input: 'hash', output: 'summary', error: 'summary' }
+      },
+      'admin.disableUser': {
+        name: 'admin.disableUser',
+        mode: 'mutate',
+        riskLevel: 'high',
+        approvalRequired: true,
+        description: 'Disable user',
+        inputSchema: {
+          type: 'object',
+          required: ['userId'],
+          properties: {
+            userId: { type: 'string' }
+          }
+        },
+        target: { type: 'http', method: 'POST', url: `${upstreamUrl}/tools/admin.disableUser` },
+        policy: 'allowMutatingApproved',
+        idempotency: { required: true },
+        audit: { input: 'hash', output: 'summary', error: 'summary', redactPaths: ['/reason'] }
+      },
+      'secrets.echo': {
+        name: 'secrets.echo',
+        mode: 'read',
+        description: 'Echo secrets',
+        target: { type: 'http', method: 'POST', url: `${upstreamUrl}/tools/secrets.echo` },
+        audit: { input: 'redacted', output: 'summary', error: 'summary' }
+      },
+      'fixture.slow': {
+        name: 'fixture.slow',
+        mode: 'read',
+        description: 'Slow tool',
+        target: { type: 'http', method: 'POST', url: `${upstreamUrl}/tools/slow`, timeoutMs: 50 }
+      },
+      'fixture.error': {
+        name: 'fixture.error',
+        mode: 'read',
+        description: 'Error tool',
+        target: { type: 'http', method: 'POST', url: `${upstreamUrl}/tools/error` }
+      }
+    },
+    configPath: join(dir, 'tool-boundary.config.yaml'),
+    configDir: dir
+  };
+}
+
+function authHeaders(): Record<string, string> {
+  return {
+    authorization: `Bearer ${token}`,
+    'content-type': 'application/json'
+  };
+}

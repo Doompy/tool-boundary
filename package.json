@@ -1,0 +1,24 @@
+{
+  "name": "tool-boundary",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*",
+    "examples/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace @tool-boundary/core && npm run build --workspace @tool-boundary/config && npm run build --workspace tool-boundary-gateway && npm run build --workspace @tool-boundary/cli && npm run build --workspace tool-boundary-basic-http-tool",
+    "typecheck": "npm run typecheck --workspace @tool-boundary/core && npm run typecheck --workspace @tool-boundary/config && npm run typecheck --workspace tool-boundary-gateway && npm run typecheck --workspace @tool-boundary/cli && npm run typecheck --workspace tool-boundary-basic-http-tool",
+    "test": "vitest run",
+    "example:basic": "npm run start --workspace tool-boundary-basic-http-tool"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.8"
+  }
+}
