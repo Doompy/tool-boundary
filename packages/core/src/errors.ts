@@ -18,13 +18,19 @@ export type ErrorCode =
 export class ToolBoundaryError extends Error {
   readonly code: ErrorCode;
   readonly details?: unknown;
+  readonly publicDetails?: unknown;
   readonly statusCode: number;
 
-  constructor(code: ErrorCode, message: string, options: { readonly details?: unknown; readonly statusCode?: number } = {}) {
+  constructor(
+    code: ErrorCode,
+    message: string,
+    options: { readonly details?: unknown; readonly publicDetails?: unknown; readonly statusCode?: number } = {}
+  ) {
     super(message);
     this.name = 'ToolBoundaryError';
     this.code = code;
     this.details = options.details;
+    this.publicDetails = options.publicDetails;
     this.statusCode = options.statusCode ?? defaultStatusCode(code);
   }
 }

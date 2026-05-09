@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { applyAuditMode, defaultSummary, hashUnknown, redactValue } from '../src/index.js';
+import { applyAuditMode, buildApprovalReview, defaultSummary, hashUnknown, redactValue } from '../src/index.js';
 
 describe('audit redaction', () => {
   it('redacts JSON Pointer paths before hashing', () => {
@@ -26,5 +26,18 @@ describe('audit redaction', () => {
     const error = new Error('secret failure');
     expect(applyAuditMode(error, 'summary')).toBe('object');
     expect(JSON.stringify(applyAuditMode(error, 'redacted', ['/message']))).not.toContain('secret failure');
+  });
+
+  it('builds approval preview from redacted JSON Pointer paths only', () => {
+    const review = buildApprovalReview(
+      { userId: 'usr_123', reason: 'sensitive', nested: { 'reason/code': 'policy' } },
+      { previewPaths: ['/userId', '/reason', '/nested/reason~1code'], redactPaths: ['/reason'] }
+    );
+    expect(review.inputPreview).toEqual({
+      '/userId': 'usr_123',
+      '/reason': '[REDACTED]',
+      '/nested/reason~1code': 'policy'
+    });
+    expect(JSON.stringify(review)).not.toContain('sensitive');
   });
 });

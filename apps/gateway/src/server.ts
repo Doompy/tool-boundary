@@ -6,6 +6,7 @@ import {
   FileIdempotencyStore,
   JsonlAuditSink,
   ToolBoundaryError,
+  buildApprovalReview,
   buildAuditEvent,
   defaultPolicy,
   evaluatePolicy,
@@ -62,6 +63,7 @@ export function createGatewayServer(config: LoadedConfig, options: GatewayServer
     const body = parseToolCallRequest(request.body);
     const auditPolicy = resolveAuditPolicy(config, tool);
     const policy = resolvePolicy(config, tool);
+    const policyHash = policyHashForToolCall(tool, policy);
     const executionId = randomUUID();
     const input = body.input;
     const inputHash = inputHashForToolCall(body);
@@ -94,7 +96,7 @@ export function createGatewayServer(config: LoadedConfig, options: GatewayServer
     }
 
     if (body.idempotencyKey !== undefined) {
-      const idempotency = await idempotencyStore.check(tool.name, body.idempotencyKey, inputHash);
+      const idempotency = await idempotencyStore.check(tool.name, body.idempotencyKey, inputHash, principal.name, policyHash);
       if (idempotency.status === 'conflict') {
         await writeDeniedAudit(auditSink, tool, executionId, principal, input, auditPolicy, {
           verdict: 'deny',
@@ -103,6 +105,13 @@ export function createGatewayServer(config: LoadedConfig, options: GatewayServer
         return sendError(reply, new ToolBoundaryError('IDEMPOTENCY_CONFLICT', 'Idempotency key conflicts with a different input'));
       }
       if (idempotency.status === 'replay') {
+        if (preliminaryDecision.verdict === 'approval_required' && idempotency.result.approvalId === undefined) {
+          await writeDeniedAudit(auditSink, tool, executionId, principal, input, auditPolicy, {
+            verdict: 'deny',
+            reason: 'Cached result no longer satisfies current approval policy'
+          });
+          return sendError(reply, new ToolBoundaryError('IDEMPOTENCY_CONFLICT', 'Idempotency replay does not satisfy current policy'));
+        }
         const replayResult: ToolCallResult = {
           ok: true,
           executionId: idempotency.result.executionId,
@@ -166,7 +175,11 @@ export function createGatewayServer(config: LoadedConfig, options: GatewayServer
       const approvalRecord = await approvalStore.create({
         toolName: tool.name,
         inputHash,
-        requestedBy: principal.name
+        requestedBy: principal.name,
+        ...buildApprovalReview(input, {
+          previewPaths: tool.approval?.previewPaths,
+          redactPaths: auditPolicy.redactPaths
+        })
       });
       await auditSink.write(
         buildAuditEvent({
@@ -242,7 +255,7 @@ export function createGatewayServer(config: LoadedConfig, options: GatewayServer
     try {
       const output = await executeToolTarget(tool, input);
       if (body.idempotencyKey !== undefined) {
-        await idempotencyStore.record(tool.name, body.idempotencyKey, inputHash, { executionId, output, approvalId: approval?.id });
+        await idempotencyStore.record(tool.name, body.idempotencyKey, inputHash, principal.name, policyHash, { executionId, output, approvalId: approval?.id });
       }
       await auditSink.write(
         buildAuditEvent({
@@ -284,7 +297,7 @@ export function createGatewayServer(config: LoadedConfig, options: GatewayServer
 
   app.get('/v1/approvals', async (request, reply) => {
     authenticate(request, config, 'approvals:read');
-    await reply.send({ approvals: await approvalStore.list() });
+    await reply.send({ approvals: (await approvalStore.list()).map(publicApprovalRecord) });
   });
 
   app.post('/v1/approvals', async (request, reply) => {
@@ -298,7 +311,11 @@ export function createGatewayServer(config: LoadedConfig, options: GatewayServer
       requestedBy: principal.name,
       resourceIds: body.resourceIds,
       dryRunHash: body.dryRunHash,
-      expiresAt: body.expiresAt
+      expiresAt: body.expiresAt,
+      ...buildApprovalReview(body.input, {
+        previewPaths: tool.approval?.previewPaths,
+        redactPaths: auditPolicy.redactPaths
+      })
     });
     await auditSink.write(
       buildAuditEvent({
@@ -310,12 +327,17 @@ export function createGatewayServer(config: LoadedConfig, options: GatewayServer
         auditPolicy
       })
     );
-    await reply.code(201).send(record);
+    await reply.code(201).send(publicApprovalRecord(record));
   });
 
   app.post('/v1/approvals/:id/approve', async (request, reply) => {
     const principal = authenticate(request, config, 'approvals:approve');
-    const { record, token } = await approvalStore.approve(getIdParam(request), principal.name);
+    const approvalId = getIdParam(request);
+    const requested = (await approvalStore.list()).find((record) => record.id === approvalId);
+    if (requested !== undefined && requested.requestedBy === principal.name) {
+      throw new ToolBoundaryError('FORBIDDEN', 'Approval requester cannot approve the same approval');
+    }
+    const { record, token } = await approvalStore.approve(approvalId, principal.name);
     const tool = getTool(config, record.toolName);
     await auditSink.write(
       buildAuditEvent({
@@ -327,7 +349,7 @@ export function createGatewayServer(config: LoadedConfig, options: GatewayServer
         auditPolicy: resolveAuditPolicy(config, tool)
       })
     );
-    await reply.send({ approval: record, approvalToken: token });
+    await reply.send({ approval: publicApprovalRecord(record), approvalToken: token });
   });
 
   app.post('/v1/approvals/:id/reject', async (request, reply) => {
@@ -343,7 +365,7 @@ export function createGatewayServer(config: LoadedConfig, options: GatewayServer
         auditPolicy: resolveAuditPolicy(config, tool)
       })
     );
-    await reply.send(record);
+    await reply.send(publicApprovalRecord(record));
   });
 
   app.get('/v1/audit', async (request, reply) => {
@@ -427,6 +449,11 @@ function publicToolDefinition(tool: ToolDefinition): ToolDefinition {
     ...tool,
     target
   };
+}
+
+function publicApprovalRecord(record: ApprovalRecord): Omit<ApprovalRecord, 'approvalTokenHash'> {
+  const { approvalTokenHash: _approvalTokenHash, ...publicRecord } = record;
+  return publicRecord;
 }
 
 function getNameParam(request: FastifyRequest): string {
@@ -561,7 +588,7 @@ async function sendError(reply: FastifyReply, error: ToolBoundaryError, executio
     error: {
       code: error.code,
       message: error.message,
-      details: error.details
+      details: error.publicDetails ?? error.details
     }
   } satisfies ToolCallResult);
 }
@@ -572,4 +599,15 @@ function getApprovalIdFromDetails(details: unknown): string | undefined {
 
 function getApprovalTokenHashFromDetails(details: unknown): string | undefined {
   return isRecord(details) && typeof details.approvalTokenHash === 'string' ? details.approvalTokenHash : undefined;
+}
+
+function policyHashForToolCall(tool: ToolDefinition, policy: ToolPolicyDefinition): string {
+  return hashUnknown({
+    toolName: tool.name,
+    mode: tool.mode,
+    riskLevel: tool.riskLevel,
+    approvalRequired: tool.approvalRequired,
+    idempotency: tool.idempotency,
+    policy
+  });
 }

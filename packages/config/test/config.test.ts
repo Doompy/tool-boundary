@@ -99,4 +99,35 @@ describe('config loader', () => {
     const diagnostics = doctorConfig(config, { TOOL_BOUNDARY_AGENT_TOKEN: 'token' });
     expect(diagnostics.map((diagnostic) => diagnostic.code)).toContain('POLICY_NOT_FOUND');
   });
+
+  it('reports static tokens that can both request and approve', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tool-boundary-config-'));
+    const path = join(dir, 'tool-boundary.config.yaml');
+    await writeFile(path, validConfig.replace('scopes: [tools:read, tools:call]', 'scopes: [tools:read, approvals:request, approvals:approve]'));
+    const config = await loadConfigUnresolved(path);
+    const diagnostics = doctorConfig(config, { TOOL_BOUNDARY_AGENT_TOKEN: 'token' });
+    expect(diagnostics.map((diagnostic) => diagnostic.code)).toContain('TOKEN_CAN_REQUEST_AND_APPROVE');
+  });
+
+  it('rejects non-POST HTTP targets in MVP config', () => {
+    const httpConfig = validConfig.replace(
+      'target:\n      type: mock\n      result:\n        ok: true',
+      'target:\n      type: http\n      method: GET\n      url: http://localhost:4001/tools/admin.searchUsers'
+    );
+    expect(() => parseConfigContent(httpConfig)).toThrow();
+  });
+
+  it('loads approval preview paths', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tool-boundary-config-'));
+    const path = join(dir, 'tool-boundary.config.yaml');
+    await writeFile(
+      path,
+      validConfig.replace(
+        'target:\n      type: mock',
+        'approval:\n      previewPaths:\n        - /userId\n        - /reason~1code\n    target:\n      type: mock'
+      )
+    );
+    const config = await loadConfig(path, { env: { TOOL_BOUNDARY_AGENT_TOKEN: 'token' } });
+    expect(config.tools['admin.searchUsers']?.approval?.previewPaths).toEqual(['/userId', '/reason~1code']);
+  });
 });

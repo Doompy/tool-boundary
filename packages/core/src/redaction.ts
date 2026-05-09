@@ -21,6 +21,18 @@ export function redactValue(value: unknown, redactPaths: readonly string[] = [])
   return cloned;
 }
 
+export function getJsonPointerValue(root: unknown, pointer: string): { readonly found: true; readonly value: unknown } | { readonly found: false } {
+  if (pointer === '') return { found: true, value: root };
+  if (!pointer.startsWith('/')) return { found: false };
+  const segments = decodeJsonPointer(pointer);
+  let current = root;
+  for (const segment of segments) {
+    current = getChild(current, segment);
+    if (current === undefined) return { found: false };
+  }
+  return { found: true, value: current };
+}
+
 export function applyAuditMode(value: unknown, mode: AuditMode, redactPaths: readonly string[] = []): unknown {
   if (mode === 'omit') return undefined;
   const redacted = redactValue(value, redactPaths);
@@ -92,10 +104,7 @@ function sortForStableSerialization(value: unknown, seen: WeakSet<object>): unkn
 function applyJsonPointerRedaction(root: unknown, pointer: string): void {
   if (pointer === '') return;
   if (!pointer.startsWith('/')) return;
-  const segments = pointer
-    .slice(1)
-    .split('/')
-    .map((segment) => segment.replaceAll('~1', '/').replaceAll('~0', '~'));
+  const segments = decodeJsonPointer(pointer);
   let current = root;
   for (let index = 0; index < segments.length - 1; index += 1) {
     current = getChild(current, segments[index]);
@@ -104,6 +113,13 @@ function applyJsonPointerRedaction(root: unknown, pointer: string): void {
   const finalSegment = segments.at(-1);
   if (finalSegment === undefined) return;
   setChild(current, finalSegment, REDACTED_VALUE);
+}
+
+function decodeJsonPointer(pointer: string): readonly string[] {
+  return pointer
+    .slice(1)
+    .split('/')
+    .map((segment) => segment.replaceAll('~1', '/').replaceAll('~0', '~'));
 }
 
 function getChild(value: unknown, segment: string): unknown {

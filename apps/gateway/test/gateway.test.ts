@@ -7,6 +7,7 @@ import type { LoadedConfig } from '@tool-boundary/config';
 import { createGatewayServer } from '../src/index.js';
 
 const agentToken = 'agent-token';
+const otherAgentToken = 'other-agent-token';
 const operatorToken = 'operator-token';
 
 let upstream: ReturnType<typeof Fastify> | undefined;
@@ -127,6 +128,35 @@ describe('gateway', () => {
     });
     expect(consumed.statusCode).toBe(400);
     expect(consumed.json().error.code).toBe('APPROVAL_ALREADY_CONSUMED');
+    expect(JSON.stringify(consumed.json())).not.toContain('approvalTokenHash');
+  });
+
+  it('does not let a requester approve its own approval even with approve scope', async () => {
+    const config = await testConfig();
+    const app = createGatewayServer({
+      ...config,
+      auth: {
+        ...config.auth,
+        tokens: config.auth.tokens.map((token) =>
+          token.name === 'local-agent' ? { ...token, scopes: [...token.scopes, 'approvals:approve'] } : token
+        )
+      }
+    });
+    const requested = await app.inject({
+      method: 'POST',
+      url: '/v1/tools/admin.disableUser/call',
+      headers: agentHeaders(),
+      payload: { input: { userId: 'usr_123', reason: 'self-approval-test' } }
+    });
+    const approvalId = requested.json().error.details.approvalId as string;
+    const approved = await app.inject({
+      method: 'POST',
+      url: `/v1/approvals/${approvalId}/approve`,
+      headers: agentHeaders(),
+      payload: {}
+    });
+    expect(approved.statusCode).toBe(403);
+    expect(approved.json().error.message).toBe('Approval requester cannot approve the same approval');
   });
 
   it('does not write raw approval tokens or configured secret fields to audit JSONL', async () => {
@@ -139,8 +169,15 @@ describe('gateway', () => {
       payload: { input: { userId: 'usr_123', reason: 'do-not-leak' } }
     });
     const approvalId = requested.json().error.details.approvalId as string;
+    const approvals = await app.inject({ method: 'GET', url: '/v1/approvals', headers: operatorHeaders() });
+    expect(approvals.statusCode).toBe(200);
+    expect(JSON.stringify(approvals.json())).toContain('usr_123');
+    expect(JSON.stringify(approvals.json())).not.toContain('do-not-leak');
+    expect(JSON.stringify(approvals.json())).not.toContain('approvalTokenHash');
+
     const approved = await app.inject({ method: 'POST', url: `/v1/approvals/${approvalId}/approve`, headers: operatorHeaders(), payload: {} });
     const approvalToken = approved.json().approvalToken as string;
+    expect(JSON.stringify(approved.json().approval)).not.toContain('approvalTokenHash');
     await app.inject({
       method: 'POST',
       url: '/v1/tools/admin.disableUser/call',
@@ -218,6 +255,51 @@ describe('gateway', () => {
     expect(second.json().error.code).toBe('IDEMPOTENCY_CONFLICT');
   });
 
+  it('does not replay idempotency records across principals', async () => {
+    const app = createGatewayServer(await testConfig());
+    const first = await app.inject({
+      method: 'POST',
+      url: '/v1/tools/admin.searchUsers/call',
+      headers: agentHeaders(),
+      payload: { idempotencyKey: 'principal-key', input: { query: 'ada' } }
+    });
+    expect(first.statusCode).toBe(200);
+
+    const second = await app.inject({
+      method: 'POST',
+      url: '/v1/tools/admin.searchUsers/call',
+      headers: otherAgentHeaders(),
+      payload: { idempotencyKey: 'principal-key', input: { query: 'ada' } }
+    });
+    expect(second.statusCode).toBe(400);
+    expect(second.json().error.code).toBe('IDEMPOTENCY_CONFLICT');
+  });
+
+  it('does not replay idempotency records after policy changes', async () => {
+    const config = await testConfig();
+    const app = createGatewayServer(config);
+    const first = await app.inject({
+      method: 'POST',
+      url: '/v1/tools/admin.searchUsers/call',
+      headers: agentHeaders(),
+      payload: { idempotencyKey: 'policy-key', input: { query: 'ada' } }
+    });
+    expect(first.statusCode).toBe(200);
+
+    (config.policies as Record<string, unknown>).default = {
+      allowedModes: ['read', 'draft', 'dryRun'],
+      requireApprovalForModes: ['read']
+    };
+    const second = await app.inject({
+      method: 'POST',
+      url: '/v1/tools/admin.searchUsers/call',
+      headers: agentHeaders(),
+      payload: { idempotencyKey: 'policy-key', input: { query: 'ada' } }
+    });
+    expect(second.statusCode).toBe(400);
+    expect(second.json().error.code).toBe('IDEMPOTENCY_CONFLICT');
+  });
+
   it('keeps missing input distinct from empty object for idempotency hashing', async () => {
     const app = createGatewayServer(await testConfig());
     const first = await app.inject({
@@ -275,6 +357,12 @@ async function testConfig(): Promise<LoadedConfig> {
           scopes: ['tools:read', 'tools:call', 'approvals:request']
         },
         {
+          name: 'other-agent',
+          tokenEnv: 'TOOL_BOUNDARY_OTHER_AGENT_TOKEN',
+          token: otherAgentToken,
+          scopes: ['tools:read', 'tools:call', 'approvals:request']
+        },
+        {
           name: 'local-operator',
           tokenEnv: 'TOOL_BOUNDARY_OPERATOR_TOKEN',
           token: operatorToken,
@@ -323,6 +411,7 @@ async function testConfig(): Promise<LoadedConfig> {
         },
         target: { type: 'http', method: 'POST', url: `${upstreamUrl}/tools/admin.disableUser` },
         policy: 'allowMutatingApproved',
+        approval: { previewPaths: ['/userId', '/reason'] },
         idempotency: { required: true },
         audit: { input: 'hash', output: 'summary', error: 'summary', redactPaths: ['/reason'] }
       },
@@ -361,6 +450,13 @@ function agentHeaders(): Record<string, string> {
 function operatorHeaders(): Record<string, string> {
   return {
     authorization: `Bearer ${operatorToken}`,
+    'content-type': 'application/json'
+  };
+}
+
+function otherAgentHeaders(): Record<string, string> {
+  return {
+    authorization: `Bearer ${otherAgentToken}`,
     'content-type': 'application/json'
   };
 }

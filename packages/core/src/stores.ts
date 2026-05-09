@@ -18,6 +18,8 @@ type IdempotencyRecord = {
   readonly toolName: string;
   readonly key: string;
   readonly inputHash: string;
+  readonly principalName: string;
+  readonly policyHash: string;
   readonly result: StoredToolCallResult;
   readonly createdAt: string;
 };
@@ -25,6 +27,32 @@ type IdempotencyRecord = {
 type IdempotencyFile = {
   readonly records: readonly IdempotencyRecord[];
 };
+
+export interface ApprovalStore {
+  list(): Promise<readonly ApprovalRecord[]>;
+  create(input: CreateApprovalInput): Promise<ApprovalRecord>;
+  approve(id: string, approvedBy: string): Promise<{ readonly record: ApprovalRecord; readonly token: string }>;
+  reject(id: string): Promise<ApprovalRecord>;
+  findApprovedByToken(toolName: string, inputHash: string, token: string): Promise<ApprovalRecord>;
+  consume(id: string): Promise<ApprovalRecord>;
+}
+
+export type IdempotencyCheckResult =
+  | { readonly status: 'miss' }
+  | { readonly status: 'replay'; readonly result: StoredToolCallResult }
+  | { readonly status: 'conflict' };
+
+export interface IdempotencyStore {
+  check(toolName: string, key: string, inputHash: string, principalName: string, policyHash: string): Promise<IdempotencyCheckResult>;
+  record(
+    toolName: string,
+    key: string,
+    inputHash: string,
+    principalName: string,
+    policyHash: string,
+    result: StoredToolCallResult
+  ): Promise<void>;
+}
 
 export class JsonlAuditSink {
   readonly path: string;
@@ -52,7 +80,7 @@ export class JsonlAuditSink {
   }
 }
 
-export class FileApprovalStore {
+export class FileApprovalStore implements ApprovalStore {
   readonly path: string;
 
   constructor(path: string) {
@@ -60,7 +88,12 @@ export class FileApprovalStore {
   }
 
   async list(): Promise<readonly ApprovalRecord[]> {
-    return (await this.read()).records;
+    const file = await this.read();
+    const materialized = materializeExpiredApprovals(file.records);
+    if (materialized.changed) {
+      await this.write({ records: materialized.records });
+    }
+    return materialized.records;
   }
 
   async create(input: CreateApprovalInput): Promise<ApprovalRecord> {
@@ -106,28 +139,33 @@ export class FileApprovalStore {
     const record = file.records.find((candidate) => candidate.toolName === toolName && candidate.approvalTokenHash === tokenHash);
     if (record === undefined) {
       throw new ToolBoundaryError('APPROVAL_INVALID', 'Approval token is invalid', {
-        details: { approvalTokenHash: tokenHash }
+        details: { approvalTokenHash: tokenHash },
+        publicDetails: {}
       });
     }
     if (record.status === 'consumed') {
       throw new ToolBoundaryError('APPROVAL_ALREADY_CONSUMED', 'Approval token has already been consumed', {
-        details: { approvalId: record.id, approvalTokenHash: tokenHash }
+        details: { approvalId: record.id, approvalTokenHash: tokenHash },
+        publicDetails: { approvalId: record.id }
       });
     }
     if (approvalIsExpired(record)) {
       await this.markExpired(record.id);
       throw new ToolBoundaryError('APPROVAL_EXPIRED', 'Approval token is expired', {
-        details: { approvalId: record.id, approvalTokenHash: tokenHash }
+        details: { approvalId: record.id, approvalTokenHash: tokenHash },
+        publicDetails: { approvalId: record.id }
       });
     }
     if (record.status !== 'approved') {
       throw new ToolBoundaryError('APPROVAL_INVALID', `Approval is ${record.status}`, {
-        details: { approvalId: record.id, approvalTokenHash: tokenHash }
+        details: { approvalId: record.id, approvalTokenHash: tokenHash },
+        publicDetails: { approvalId: record.id }
       });
     }
     if (record.inputHash !== inputHash) {
       throw new ToolBoundaryError('APPROVAL_INVALID', 'Approval input hash does not match this call', {
-        details: { approvalId: record.id, approvalTokenHash: tokenHash }
+        details: { approvalId: record.id, approvalTokenHash: tokenHash },
+        publicDetails: { approvalId: record.id }
       });
     }
     return record;
@@ -184,7 +222,7 @@ export class FileApprovalStore {
   }
 }
 
-export class FileIdempotencyStore {
+export class FileIdempotencyStore implements IdempotencyStore {
   readonly path: string;
 
   constructor(path: string) {
@@ -194,23 +232,36 @@ export class FileIdempotencyStore {
   async check(
     toolName: string,
     key: string,
-    inputHash: string
-  ): Promise<{ readonly status: 'miss' } | { readonly status: 'replay'; readonly result: StoredToolCallResult } | { readonly status: 'conflict' }> {
+    inputHash: string,
+    principalName: string,
+    policyHash: string
+  ): Promise<IdempotencyCheckResult> {
     const file = await this.read();
     const record = file.records.find((candidate) => candidate.toolName === toolName && candidate.key === key);
     if (record === undefined) return { status: 'miss' };
     if (record.inputHash !== inputHash) return { status: 'conflict' };
+    if (record.principalName !== principalName) return { status: 'conflict' };
+    if (record.policyHash !== policyHash) return { status: 'conflict' };
     return { status: 'replay', result: record.result };
   }
 
-  async record(toolName: string, key: string, inputHash: string, result: StoredToolCallResult): Promise<void> {
+  async record(
+    toolName: string,
+    key: string,
+    inputHash: string,
+    principalName: string,
+    policyHash: string,
+    result: StoredToolCallResult
+  ): Promise<void> {
     const file = await this.read();
     const records = file.records.filter((candidate) => !(candidate.toolName === toolName && candidate.key === key));
     records.push({
       toolName,
       key,
       inputHash,
-      result,
+      principalName,
+      policyHash,
+      result: { ...result, policyHash },
       createdAt: new Date().toISOString()
     });
     await this.write({ records });
@@ -233,4 +284,18 @@ export class FileIdempotencyStore {
 
 function isMissingFile(error: unknown): boolean {
   return typeof error === 'object' && error !== null && (error as { readonly code?: unknown }).code === 'ENOENT';
+}
+
+function materializeExpiredApprovals(records: readonly ApprovalRecord[]): { readonly records: readonly ApprovalRecord[]; readonly changed: boolean } {
+  let changed = false;
+  const now = new Date();
+  const updatedAt = now.toISOString();
+  const materialized = records.map((record) => {
+    if ((record.status === 'requested' || record.status === 'approved') && approvalIsExpired(record, now)) {
+      changed = true;
+      return { ...record, status: 'expired' as const, updatedAt };
+    }
+    return record;
+  });
+  return { records: materialized, changed };
 }

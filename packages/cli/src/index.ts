@@ -240,6 +240,10 @@ tools:
       url: http://localhost:4001/tools/admin.disableUser
       timeoutMs: 5000
     policy: allow-mutating-approved
+    approval:
+      previewPaths:
+        - /userId
+        - /reason
     idempotency:
       required: true
     audit:

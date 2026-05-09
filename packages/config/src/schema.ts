@@ -14,6 +14,10 @@ export const idempotencyPolicySchema = z.object({
   required: z.boolean().optional()
 });
 
+export const toolApprovalPolicySchema = z.object({
+  previewPaths: z.array(z.string()).optional()
+});
+
 export const toolPolicySchema = z.object({
   allowedModes: z.array(toolModeSchema).optional(),
   requireApprovalForModes: z.array(toolModeSchema).optional(),
@@ -24,7 +28,7 @@ export const toolPolicySchema = z.object({
 
 const httpTargetSchema = z.object({
   type: z.literal('http'),
-  method: z.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']),
+  method: z.literal('POST'),
   url: z.url(),
   headers: z.record(z.string(), z.string()).optional(),
   timeoutMs: z.number().int().positive().optional()
@@ -44,6 +48,7 @@ export const rawToolDefinitionSchema = z.object({
   outputSchema: z.unknown().optional(),
   target: z.discriminatedUnion('type', [httpTargetSchema, mockTargetSchema]),
   policy: z.string().optional(),
+  approval: toolApprovalPolicySchema.optional(),
   audit: auditPayloadPolicySchema.optional(),
   idempotency: idempotencyPolicySchema.optional(),
   tags: z.array(z.string()).optional(),

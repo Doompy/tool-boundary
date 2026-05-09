@@ -63,6 +63,7 @@ node packages/cli/dist/index.js serve --config ./tool-boundary.config.yaml
 - Mutating calls can require approval and idempotency keys.
 - Agent and operator tokens should use separate scopes: agents call tools and request approvals, while operators approve/reject and read audit.
 - Output summaries are structural and do not serialize full objects by default.
+- Local JSON file stores are intended for MVP/local development. Production storage should use the store interfaces with SQLite or Postgres.
 
 ## Local Demo
 

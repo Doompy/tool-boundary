@@ -5,7 +5,7 @@ export type ToolRiskLevel = 'low' | 'medium' | 'high' | 'critical';
 export type ToolTarget =
   | {
       readonly type: 'http';
-      readonly method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+      readonly method: 'POST';
       readonly url: string;
       readonly headers?: Readonly<Record<string, string>>;
       readonly timeoutMs?: number;
@@ -32,6 +32,10 @@ export type IdempotencyPolicy = {
 
 export type ToolPolicyRef = string;
 
+export type ToolApprovalPolicy = {
+  readonly previewPaths?: readonly string[];
+};
+
 export type ToolDefinition = {
   readonly name: string;
   readonly description?: string;
@@ -42,6 +46,7 @@ export type ToolDefinition = {
   readonly outputSchema?: unknown;
   readonly target: ToolTarget;
   readonly policy?: ToolPolicyRef;
+  readonly approval?: ToolApprovalPolicy;
   readonly audit?: AuditPayloadPolicy;
   readonly idempotency?: IdempotencyPolicy;
   readonly tags?: readonly string[];
@@ -102,6 +107,8 @@ export type ApprovalRecord = {
   readonly requestedBy: string;
   readonly approvedBy?: string;
   readonly approvalTokenHash?: string;
+  readonly inputSummary?: string;
+  readonly inputPreview?: unknown;
   readonly expiresAt?: string;
   readonly createdAt: string;
   readonly updatedAt: string;
@@ -143,4 +150,5 @@ export type StoredToolCallResult = {
   readonly executionId: string;
   readonly output: unknown;
   readonly approvalId?: string;
+  readonly policyHash?: string;
 };

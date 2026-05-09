@@ -25,6 +25,13 @@ export function doctorConfig(config: UnresolvedLoadedConfig, env: NodeJS.Process
         message: `Static token env ${token.tokenEnv} is not set`
       });
     }
+    if (token.scopes.includes('approvals:request') && (token.scopes.includes('approvals:approve') || token.scopes.includes('approvals:reject'))) {
+      diagnostics.push({
+        severity: 'warning',
+        code: 'TOKEN_CAN_REQUEST_AND_APPROVE',
+        message: `Static token ${token.name} can both request and approve or reject approvals`
+      });
+    }
   }
 
   for (const tool of Object.values(config.tools)) {
