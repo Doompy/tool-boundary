@@ -16,7 +16,10 @@ import {
   requiresIdempotency,
   toToolBoundaryError,
   type ApprovalRecord,
+  type ApprovalStore,
+  type AuditSink,
   type AuditPayloadPolicy,
+  type IdempotencyStore,
   type PolicyDecision,
   type ToolCallRequest,
   type ToolCallResult,
@@ -33,14 +36,19 @@ type Principal = {
 
 export type GatewayServerOptions = {
   readonly logger?: boolean;
+  readonly stores?: {
+    readonly auditSink?: AuditSink;
+    readonly approvalStore?: ApprovalStore;
+    readonly idempotencyStore?: IdempotencyStore;
+  };
 };
 
 export function createGatewayServer(config: LoadedConfig, options: GatewayServerOptions = {}): FastifyInstance {
   const app = Fastify({ logger: options.logger ?? false });
   const paths = resolveRuntimePaths(config);
-  const auditSink = new JsonlAuditSink(paths.auditPath);
-  const approvalStore = new FileApprovalStore(paths.approvalsPath);
-  const idempotencyStore = new FileIdempotencyStore(paths.idempotencyPath);
+  const auditSink = options.stores?.auditSink ?? new JsonlAuditSink(paths.auditPath);
+  const approvalStore = options.stores?.approvalStore ?? new FileApprovalStore(paths.approvalsPath);
+  const idempotencyStore = options.stores?.idempotencyStore ?? new FileIdempotencyStore(paths.idempotencyPath);
 
   app.get('/healthz', async () => ({ ok: true }));
 
@@ -86,7 +94,13 @@ export function createGatewayServer(config: LoadedConfig, options: GatewayServer
         verdict: 'deny',
         reason: 'Input schema validation failed'
       });
-      return sendError(reply, new ToolBoundaryError('TOOL_SCHEMA_VALIDATION_FAILED', 'Input schema validation failed', { details: validation.details }));
+      return sendError(
+        reply,
+        new ToolBoundaryError('TOOL_SCHEMA_VALIDATION_FAILED', 'Input schema validation failed', {
+          details: validation.details,
+          publicDetails: { issues: validation.details }
+        })
+      );
     }
 
     const preliminaryDecision = evaluatePolicy({ tool, policy, hasValidApproval: false });
@@ -207,7 +221,8 @@ export function createGatewayServer(config: LoadedConfig, options: GatewayServer
       return sendError(
         reply,
         new ToolBoundaryError('APPROVAL_REQUIRED', decision.reason, {
-          details: { approvalId: approvalRecord.id }
+          details: { approvalId: approvalRecord.id },
+          publicDetails: { approvalId: approvalRecord.id }
         })
       );
     }
@@ -296,7 +311,11 @@ export function createGatewayServer(config: LoadedConfig, options: GatewayServer
   });
 
   app.get('/v1/approvals', async (request, reply) => {
-    authenticate(request, config, 'approvals:read');
+    const principal = authenticate(request, config, 'approvals:read');
+    const expired = await approvalStore.expireDue();
+    for (const record of expired) {
+      await writeApprovalExpiredAudit(config, auditSink, principal, record);
+    }
     await reply.send({ approvals: (await approvalStore.list()).map(publicApprovalRecord) });
   });
 
@@ -337,7 +356,17 @@ export function createGatewayServer(config: LoadedConfig, options: GatewayServer
     if (requested !== undefined && requested.requestedBy === principal.name) {
       throw new ToolBoundaryError('FORBIDDEN', 'Approval requester cannot approve the same approval');
     }
-    const { record, token } = await approvalStore.approve(approvalId, principal.name);
+    let record: ApprovalRecord;
+    let token: string;
+    try {
+      ({ record, token } = await approvalStore.approve(approvalId, principal.name));
+    } catch (error) {
+      const normalized = toToolBoundaryError(error);
+      if (normalized.code === 'APPROVAL_EXPIRED') {
+        await writeApprovalExpiredAuditFromError(config, auditSink, principal, normalized);
+      }
+      return sendError(reply, normalized);
+    }
     const tool = getTool(config, record.toolName);
     await auditSink.write(
       buildAuditEvent({
@@ -354,7 +383,16 @@ export function createGatewayServer(config: LoadedConfig, options: GatewayServer
 
   app.post('/v1/approvals/:id/reject', async (request, reply) => {
     const principal = authenticate(request, config, 'approvals:reject');
-    const record = await approvalStore.reject(getIdParam(request));
+    let record: ApprovalRecord;
+    try {
+      record = await approvalStore.reject(getIdParam(request));
+    } catch (error) {
+      const normalized = toToolBoundaryError(error);
+      if (normalized.code === 'APPROVAL_EXPIRED') {
+        await writeApprovalExpiredAuditFromError(config, auditSink, principal, normalized);
+      }
+      return sendError(reply, normalized);
+    }
     const tool = getTool(config, record.toolName);
     await auditSink.write(
       buildAuditEvent({
@@ -560,7 +598,7 @@ function matchesJsonType(value: unknown, type: string): boolean {
 }
 
 async function writeDeniedAudit(
-  auditSink: JsonlAuditSink,
+  auditSink: AuditSink,
   tool: ToolDefinition,
   executionId: string,
   principal: Principal,
@@ -588,9 +626,46 @@ async function sendError(reply: FastifyReply, error: ToolBoundaryError, executio
     error: {
       code: error.code,
       message: error.message,
-      details: error.publicDetails ?? error.details
+      details: error.publicDetails
     }
   } satisfies ToolCallResult);
+}
+
+async function writeApprovalExpiredAudit(config: LoadedConfig, auditSink: AuditSink, principal: Principal, record: ApprovalRecord): Promise<void> {
+  const tool = getTool(config, record.toolName);
+  await auditSink.write(
+    buildAuditEvent({
+      eventType: 'approval_expired',
+      tool,
+      userId: principal.name,
+      approvalId: record.id,
+      approvalTokenHash: record.approvalTokenHash,
+      auditPolicy: resolveAuditPolicy(config, tool)
+    })
+  );
+}
+
+async function writeApprovalExpiredAuditFromError(
+  config: LoadedConfig,
+  auditSink: AuditSink,
+  principal: Principal,
+  error: ToolBoundaryError
+): Promise<void> {
+  const details = isRecord(error.details) ? error.details : {};
+  const approvalId = typeof details.approvalId === 'string' ? details.approvalId : undefined;
+  const toolName = typeof details.toolName === 'string' ? details.toolName : undefined;
+  if (approvalId === undefined || toolName === undefined) return;
+  const tool = getTool(config, toolName);
+  await auditSink.write(
+    buildAuditEvent({
+      eventType: 'approval_expired',
+      tool,
+      userId: principal.name,
+      approvalId,
+      approvalTokenHash: getApprovalTokenHashFromDetails(error.details),
+      auditPolicy: resolveAuditPolicy(config, tool)
+    })
+  );
 }
 
 function getApprovalIdFromDetails(details: unknown): string | undefined {

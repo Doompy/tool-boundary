@@ -61,9 +61,10 @@ node packages/cli/dist/index.js serve --config ./tool-boundary.config.yaml
 - Audit payload redaction runs before hashing or summary generation.
 - Default policy allows only `read`, `draft`, and `dryRun`.
 - Mutating calls can require approval and idempotency keys.
+- Idempotency keys are scoped per authenticated principal; another principal using the same key gets an independent execution.
 - Agent and operator tokens should use separate scopes: agents call tools and request approvals, while operators approve/reject and read audit.
 - Output summaries are structural and do not serialize full objects by default.
-- Local JSON file stores are intended for MVP/local development. Production storage should use the store interfaces with SQLite or Postgres.
+- Local JSON file stores are intended for MVP/local development. Production storage should inject custom store implementations through the gateway store interfaces.
 
 ## Local Demo
 

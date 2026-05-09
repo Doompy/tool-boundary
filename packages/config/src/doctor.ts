@@ -63,6 +63,15 @@ function doctorTool(tool: ToolDefinition, config: UnresolvedLoadedConfig): reado
     });
   }
 
+  if (isHighRisk(tool) && requiresApproval(tool, policy) && (tool.approval?.previewPaths?.length ?? 0) === 0) {
+    diagnostics.push({
+      severity: 'warning',
+      code: 'HIGH_RISK_WITHOUT_APPROVAL_PREVIEW',
+      message: 'High or critical risk approval-required tool should define approval preview paths',
+      toolName: tool.name
+    });
+  }
+
   if (tool.description === undefined || tool.description.trim().length === 0) {
     diagnostics.push({
       severity: 'warning',
@@ -113,15 +122,6 @@ function doctorTool(tool: ToolDefinition, config: UnresolvedLoadedConfig): reado
       severity: 'error',
       code: 'MUTATE_WITHOUT_IDEMPOTENCY',
       message: 'Mutating tool must require idempotency through tool or policy config',
-      toolName: tool.name
-    });
-  }
-
-  if (tool.target.type === 'http' && tool.target.method !== 'POST') {
-    diagnostics.push({
-      severity: 'warning',
-      code: 'HTTP_METHOD_NOT_SUPPORTED_IN_MVP',
-      message: 'MVP only executes HTTP POST upstream targets',
       toolName: tool.name
     });
   }

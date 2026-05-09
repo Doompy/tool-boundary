@@ -28,8 +28,14 @@ type IdempotencyFile = {
   readonly records: readonly IdempotencyRecord[];
 };
 
+export interface AuditSink {
+  write(event: AuditEvent): Promise<void>;
+  readAll(): Promise<readonly AuditEvent[]>;
+}
+
 export interface ApprovalStore {
   list(): Promise<readonly ApprovalRecord[]>;
+  expireDue(now?: Date): Promise<readonly ApprovalRecord[]>;
   create(input: CreateApprovalInput): Promise<ApprovalRecord>;
   approve(id: string, approvedBy: string): Promise<{ readonly record: ApprovalRecord; readonly token: string }>;
   reject(id: string): Promise<ApprovalRecord>;
@@ -54,7 +60,7 @@ export interface IdempotencyStore {
   ): Promise<void>;
 }
 
-export class JsonlAuditSink {
+export class JsonlAuditSink implements AuditSink {
   readonly path: string;
 
   constructor(path: string) {
@@ -88,12 +94,16 @@ export class FileApprovalStore implements ApprovalStore {
   }
 
   async list(): Promise<readonly ApprovalRecord[]> {
+    return (await this.read()).records;
+  }
+
+  async expireDue(now = new Date()): Promise<readonly ApprovalRecord[]> {
     const file = await this.read();
-    const materialized = materializeExpiredApprovals(file.records);
-    if (materialized.changed) {
+    const materialized = materializeExpiredApprovals(file.records, now);
+    if (materialized.expired.length > 0) {
       await this.write({ records: materialized.records });
     }
-    return materialized.records;
+    return materialized.expired;
   }
 
   async create(input: CreateApprovalInput): Promise<ApprovalRecord> {
@@ -105,30 +115,28 @@ export class FileApprovalStore implements ApprovalStore {
 
   async approve(id: string, approvedBy: string): Promise<{ readonly record: ApprovalRecord; readonly token: string }> {
     const token = generateApprovalToken();
-    const updated = await this.updateRecord(id, (record) => {
-      if (record.status !== 'requested') {
-        throw new ToolBoundaryError('APPROVAL_INVALID', `Approval ${id} is not requestable`);
-      }
+    const updated = await this.updateRecord(id, (record, now) => {
+      throwIfExpired(record, now);
+      if (record.status !== 'requested') throw new ToolBoundaryError('APPROVAL_INVALID', `Approval ${id} is not requestable`);
       return {
         ...record,
         status: 'approved',
         approvedBy,
         approvalTokenHash: hashApprovalToken(token),
-        updatedAt: new Date().toISOString()
+        updatedAt: now.toISOString()
       };
     });
     return { record: updated, token };
   }
 
   async reject(id: string): Promise<ApprovalRecord> {
-    return this.updateRecord(id, (record) => {
-      if (record.status !== 'requested') {
-        throw new ToolBoundaryError('APPROVAL_INVALID', `Approval ${id} cannot be rejected`);
-      }
+    return this.updateRecord(id, (record, now) => {
+      throwIfExpired(record, now);
+      if (record.status !== 'requested') throw new ToolBoundaryError('APPROVAL_INVALID', `Approval ${id} cannot be rejected`);
       return {
         ...record,
         status: 'rejected',
-        updatedAt: new Date().toISOString()
+        updatedAt: now.toISOString()
       };
     });
   }
@@ -145,26 +153,26 @@ export class FileApprovalStore implements ApprovalStore {
     }
     if (record.status === 'consumed') {
       throw new ToolBoundaryError('APPROVAL_ALREADY_CONSUMED', 'Approval token has already been consumed', {
-        details: { approvalId: record.id, approvalTokenHash: tokenHash },
+        details: { approvalId: record.id, approvalTokenHash: tokenHash, toolName: record.toolName },
         publicDetails: { approvalId: record.id }
       });
     }
     if (approvalIsExpired(record)) {
       await this.markExpired(record.id);
       throw new ToolBoundaryError('APPROVAL_EXPIRED', 'Approval token is expired', {
-        details: { approvalId: record.id, approvalTokenHash: tokenHash },
+        details: { approvalId: record.id, approvalTokenHash: tokenHash, toolName: record.toolName },
         publicDetails: { approvalId: record.id }
       });
     }
     if (record.status !== 'approved') {
       throw new ToolBoundaryError('APPROVAL_INVALID', `Approval is ${record.status}`, {
-        details: { approvalId: record.id, approvalTokenHash: tokenHash },
+        details: { approvalId: record.id, approvalTokenHash: tokenHash, toolName: record.toolName },
         publicDetails: { approvalId: record.id }
       });
     }
     if (record.inputHash !== inputHash) {
       throw new ToolBoundaryError('APPROVAL_INVALID', 'Approval input hash does not match this call', {
-        details: { approvalId: record.id, approvalTokenHash: tokenHash },
+        details: { approvalId: record.id, approvalTokenHash: tokenHash, toolName: record.toolName },
         publicDetails: { approvalId: record.id }
       });
     }
@@ -172,35 +180,52 @@ export class FileApprovalStore implements ApprovalStore {
   }
 
   async consume(id: string): Promise<ApprovalRecord> {
-    return this.updateRecord(id, (record) => {
-      if (record.status !== 'approved') {
-        throw new ToolBoundaryError('APPROVAL_INVALID', `Approval ${id} cannot be consumed`);
-      }
+    return this.updateRecord(id, (record, now) => {
+      throwIfExpired(record, now);
+      if (record.status !== 'approved') throw new ToolBoundaryError('APPROVAL_INVALID', `Approval ${id} cannot be consumed`);
       return {
         ...record,
         status: 'consumed',
-        updatedAt: new Date().toISOString()
+        updatedAt: now.toISOString()
       };
     });
   }
 
   private async markExpired(id: string): Promise<ApprovalRecord> {
-    return this.updateRecord(id, (record) => ({
+    return this.updateRecord(id, (record, now) => ({
       ...record,
       status: 'expired',
-      updatedAt: new Date().toISOString()
+      updatedAt: now.toISOString()
     }));
   }
 
-  private async updateRecord(id: string, update: (record: ApprovalRecord) => ApprovalRecord): Promise<ApprovalRecord> {
+  private async updateRecord(id: string, update: (record: ApprovalRecord, now: Date) => ApprovalRecord): Promise<ApprovalRecord> {
     const file = await this.read();
     let found: ApprovalRecord | undefined;
+    let expired: ApprovalRecord | undefined;
+    const now = new Date();
     const records = file.records.map((record) => {
       if (record.id !== id) return record;
-      found = update(record);
-      return found;
+      try {
+        found = update(record, now);
+        return found;
+      } catch (error) {
+        if (isApprovalExpiredError(error) && isExpirable(record) && approvalIsExpired(record, now)) {
+          expired = {
+            ...record,
+            status: 'expired',
+            updatedAt: now.toISOString()
+          };
+          return expired;
+        }
+        throw error;
+      }
     });
     if (found === undefined) {
+      if (expired !== undefined) {
+        await this.write({ records });
+        throw approvalExpiredError(expired);
+      }
       throw new ToolBoundaryError('APPROVAL_INVALID', `Approval ${id} was not found`);
     }
     await this.write({ records });
@@ -237,10 +262,11 @@ export class FileIdempotencyStore implements IdempotencyStore {
     policyHash: string
   ): Promise<IdempotencyCheckResult> {
     const file = await this.read();
-    const record = file.records.find((candidate) => candidate.toolName === toolName && candidate.key === key);
+    const record = file.records.find(
+      (candidate) => candidate.toolName === toolName && candidate.key === key && candidate.principalName === principalName
+    );
     if (record === undefined) return { status: 'miss' };
     if (record.inputHash !== inputHash) return { status: 'conflict' };
-    if (record.principalName !== principalName) return { status: 'conflict' };
     if (record.policyHash !== policyHash) return { status: 'conflict' };
     return { status: 'replay', result: record.result };
   }
@@ -254,7 +280,7 @@ export class FileIdempotencyStore implements IdempotencyStore {
     result: StoredToolCallResult
   ): Promise<void> {
     const file = await this.read();
-    const records = file.records.filter((candidate) => !(candidate.toolName === toolName && candidate.key === key));
+    const records = file.records.filter((candidate) => !(candidate.toolName === toolName && candidate.key === key && candidate.principalName === principalName));
     records.push({
       toolName,
       key,
@@ -286,16 +312,40 @@ function isMissingFile(error: unknown): boolean {
   return typeof error === 'object' && error !== null && (error as { readonly code?: unknown }).code === 'ENOENT';
 }
 
-function materializeExpiredApprovals(records: readonly ApprovalRecord[]): { readonly records: readonly ApprovalRecord[]; readonly changed: boolean } {
-  let changed = false;
-  const now = new Date();
+function materializeExpiredApprovals(
+  records: readonly ApprovalRecord[],
+  now = new Date()
+): { readonly records: readonly ApprovalRecord[]; readonly expired: readonly ApprovalRecord[] } {
+  const expired: ApprovalRecord[] = [];
   const updatedAt = now.toISOString();
   const materialized = records.map((record) => {
     if ((record.status === 'requested' || record.status === 'approved') && approvalIsExpired(record, now)) {
-      changed = true;
-      return { ...record, status: 'expired' as const, updatedAt };
+      const next = { ...record, status: 'expired' as const, updatedAt };
+      expired.push(next);
+      return next;
     }
     return record;
   });
-  return { records: materialized, changed };
+  return { records: materialized, expired };
+}
+
+function isExpirable(record: ApprovalRecord): boolean {
+  return record.status === 'requested' || record.status === 'approved';
+}
+
+function approvalExpiredError(record: ApprovalRecord): ToolBoundaryError {
+  return new ToolBoundaryError('APPROVAL_EXPIRED', 'Approval is expired', {
+    details: { approvalId: record.id, toolName: record.toolName, approvalTokenHash: record.approvalTokenHash },
+    publicDetails: { approvalId: record.id }
+  });
+}
+
+function throwIfExpired(record: ApprovalRecord, now: Date): void {
+  if (isExpirable(record) && approvalIsExpired(record, now)) {
+    throw approvalExpiredError(record);
+  }
+}
+
+function isApprovalExpiredError(error: unknown): boolean {
+  return error instanceof ToolBoundaryError && error.code === 'APPROVAL_EXPIRED';
 }

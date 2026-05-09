@@ -73,6 +73,23 @@ describe('config loader', () => {
     expect(diagnostics.map((diagnostic) => diagnostic.code)).toContain('STATIC_TOKEN_ENV_MISSING');
   });
 
+  it('reports high-risk approval-required tools without approval preview paths', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tool-boundary-config-'));
+    const path = join(dir, 'tool-boundary.config.yaml');
+    await writeFile(
+      path,
+      validConfig
+        .replace(
+          'policies:\n  default:\n    allowedModes: [read, draft, dryRun]',
+          'policies:\n  default:\n    allowedModes: [read, draft, dryRun]\n  mutating:\n    allowedModes: [read, draft, dryRun, mutate]\n    requireApprovalForModes: [mutate]\n    requireIdempotencyForModes: [mutate]'
+        )
+        .replace('mode: read', 'mode: mutate\n    riskLevel: high\n    approvalRequired: true\n    policy: mutating')
+    );
+    const config = await loadConfigUnresolved(path);
+    const diagnostics = doctorConfig(config, { TOOL_BOUNDARY_AGENT_TOKEN: 'token' });
+    expect(diagnostics.map((diagnostic) => diagnostic.code)).toContain('HIGH_RISK_WITHOUT_APPROVAL_PREVIEW');
+  });
+
   it('uses runtime policy rules when checking mutate approval and idempotency', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'tool-boundary-config-'));
     const path = join(dir, 'tool-boundary.config.yaml');
@@ -129,5 +146,13 @@ describe('config loader', () => {
     );
     const config = await loadConfig(path, { env: { TOOL_BOUNDARY_AGENT_TOKEN: 'token' } });
     expect(config.tools['admin.searchUsers']?.approval?.previewPaths).toEqual(['/userId', '/reason~1code']);
+  });
+
+  it('rejects invalid approval preview paths', () => {
+    const config = validConfig.replace(
+      'target:\n      type: mock',
+      'approval:\n      previewPaths:\n        - userId\n    target:\n      type: mock'
+    );
+    expect(() => parseConfigContent(config)).toThrow();
   });
 });

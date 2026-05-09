@@ -2,7 +2,15 @@ import { mkdtemp, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { describe, expect, it } from 'vitest';
-import { FileApprovalStore, FileIdempotencyStore, hashApprovalToken, type ApprovalStore, type IdempotencyStore } from '../src/index.js';
+import {
+  FileApprovalStore,
+  FileIdempotencyStore,
+  JsonlAuditSink,
+  hashApprovalToken,
+  type ApprovalStore,
+  type AuditSink,
+  type IdempotencyStore
+} from '../src/index.js';
 
 describe('file stores', () => {
   it('stores only approval token hashes and consumes once', async () => {
@@ -31,7 +39,7 @@ describe('file stores', () => {
     expect(await store.check('tool', 'key', 'hash-a', 'agent-a', 'policy-a')).toEqual({ status: 'miss' });
     await store.record('tool', 'key', 'hash-a', 'agent-a', 'policy-a', { executionId: 'exec-1', output: { ok: true } });
     expect(await store.check('tool', 'key', 'hash-b', 'agent-a', 'policy-a')).toEqual({ status: 'conflict' });
-    expect(await store.check('tool', 'key', 'hash-a', 'agent-b', 'policy-a')).toEqual({ status: 'conflict' });
+    expect(await store.check('tool', 'key', 'hash-a', 'agent-b', 'policy-a')).toEqual({ status: 'miss' });
     expect(await store.check('tool', 'key', 'hash-a', 'agent-a', 'policy-b')).toEqual({ status: 'conflict' });
     expect(await store.check('tool', 'key', 'hash-a', 'agent-a', 'policy-a')).toEqual({
       status: 'replay',
@@ -57,10 +65,10 @@ describe('file stores', () => {
       })
     );
     const store = new FileIdempotencyStore(path);
-    expect(await store.check('tool', 'legacy', 'hash-a', 'agent-a', 'policy-a')).toEqual({ status: 'conflict' });
+    expect(await store.check('tool', 'legacy', 'hash-a', 'agent-a', 'policy-a')).toEqual({ status: 'miss' });
   });
 
-  it('materializes expired approvals during list', async () => {
+  it('keeps list read-only and materializes expired approvals through expireDue', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'tool-boundary-core-'));
     const store = new FileApprovalStore(join(dir, 'approvals.json'));
     const record = await store.create({
@@ -69,6 +77,38 @@ describe('file stores', () => {
       requestedBy: 'local-agent',
       expiresAt: '2000-01-01T00:00:00.000Z'
     });
+    expect((await store.list()).find((item) => item.id === record.id)?.status).toBe('requested');
+    expect((await store.expireDue()).map((item) => item.id)).toEqual([record.id]);
     expect((await store.list()).find((item) => item.id === record.id)?.status).toBe('expired');
+    expect(await store.expireDue()).toEqual([]);
+  });
+
+  it('rejects expired approvals inside approve', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tool-boundary-core-'));
+    const store = new FileApprovalStore(join(dir, 'approvals.json'));
+    const record = await store.create({
+      toolName: 'admin.disableUser',
+      inputHash: 'input-hash',
+      requestedBy: 'local-agent',
+      expiresAt: '2000-01-01T00:00:00.000Z'
+    });
+    await expect(store.approve(record.id, 'operator')).rejects.toMatchObject({
+      code: 'APPROVAL_EXPIRED',
+      publicDetails: { approvalId: record.id }
+    });
+    expect((await store.list()).find((item) => item.id === record.id)?.status).toBe('expired');
+  });
+
+  it('uses JsonlAuditSink through the AuditSink interface', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tool-boundary-core-'));
+    const sink: AuditSink = new JsonlAuditSink(join(dir, 'audit.jsonl'));
+    await sink.write({
+      id: 'audit-1',
+      eventType: 'tool_call_started',
+      toolName: 'tool',
+      mode: 'read',
+      createdAt: new Date().toISOString()
+    });
+    expect((await sink.readAll()).map((event) => event.id)).toEqual(['audit-1']);
   });
 });

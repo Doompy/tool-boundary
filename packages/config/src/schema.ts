@@ -2,6 +2,9 @@ import { z } from 'zod';
 
 const toolModeSchema = z.enum(['read', 'draft', 'dryRun', 'mutate']);
 const riskLevelSchema = z.enum(['low', 'medium', 'high', 'critical']);
+const jsonPointerSchema = z.string().refine((value) => value === '' || value.startsWith('/'), {
+  message: 'JSON Pointer must be empty string or start with /'
+});
 
 export const auditPayloadPolicySchema = z.object({
   input: z.enum(['full', 'redacted', 'hash', 'omit']).optional(),
@@ -15,7 +18,7 @@ export const idempotencyPolicySchema = z.object({
 });
 
 export const toolApprovalPolicySchema = z.object({
-  previewPaths: z.array(z.string()).optional()
+  previewPaths: z.array(jsonPointerSchema).optional()
 });
 
 export const toolPolicySchema = z.object({

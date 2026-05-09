@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import Fastify from 'fastify';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { LoadedConfig } from '@tool-boundary/config';
+import { FileApprovalStore, FileIdempotencyStore, JsonlAuditSink } from '@tool-boundary/core';
 import { createGatewayServer } from '../src/index.js';
 
 const agentToken = 'agent-token';
@@ -51,6 +52,29 @@ describe('gateway', () => {
     });
     expect(call.statusCode).toBe(200);
     expect(call.json()).toMatchObject({ ok: true, toolName: 'admin.searchUsers' });
+  });
+
+  it('uses injected stores instead of default file store paths', async () => {
+    const config = await testConfig();
+    const customDir = await mkdtemp(join(tmpdir(), 'tool-boundary-custom-stores-'));
+    const app = createGatewayServer(config, {
+      stores: {
+        approvalStore: new FileApprovalStore(join(customDir, 'approvals.json')),
+        idempotencyStore: new FileIdempotencyStore(join(customDir, 'idempotency.json')),
+        auditSink: new JsonlAuditSink(join(customDir, 'audit.jsonl'))
+      }
+    });
+
+    const call = await app.inject({
+      method: 'POST',
+      url: '/v1/tools/admin.searchUsers/call',
+      headers: agentHeaders(),
+      payload: { idempotencyKey: 'custom-store-key', input: { query: 'ada' } }
+    });
+    expect(call.statusCode).toBe(200);
+    expect(await readFile(join(customDir, 'idempotency.json'), 'utf8')).toContain('custom-store-key');
+    expect(await readFile(join(customDir, 'audit.jsonl'), 'utf8')).toContain('tool_call_succeeded');
+    await expect(readFile(join(config.configDir, '.tool-boundary', 'idempotency.json'), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('requires approval and idempotency for mutating tools, then consumes approval once', async () => {
@@ -214,6 +238,59 @@ describe('gateway', () => {
     expect(operatorAudit.statusCode).toBe(200);
   });
 
+  it('expires approvals during list and audits the lifecycle event', async () => {
+    const config = await testConfig();
+    const app = createGatewayServer(config);
+    const created = await app.inject({
+      method: 'POST',
+      url: '/v1/approvals',
+      headers: agentHeaders(),
+      payload: {
+        toolName: 'admin.disableUser',
+        input: { userId: 'usr_123', reason: 'expired-list-test' },
+        expiresAt: '2000-01-01T00:00:00.000Z'
+      }
+    });
+    expect(created.statusCode).toBe(201);
+    const approvalId = created.json().id as string;
+
+    const approvals = await app.inject({ method: 'GET', url: '/v1/approvals', headers: operatorHeaders() });
+    expect(approvals.statusCode).toBe(200);
+    const approval = approvals.json().approvals.find((item: { readonly id: string }) => item.id === approvalId);
+    expect(approval.status).toBe('expired');
+    expect(await readFile(join(config.configDir, '.tool-boundary', 'audit.jsonl'), 'utf8')).toContain('approval_expired');
+  });
+
+  it('rejects approving expired approvals and audits the expiry', async () => {
+    const config = await testConfig();
+    const app = createGatewayServer(config);
+    const created = await app.inject({
+      method: 'POST',
+      url: '/v1/approvals',
+      headers: agentHeaders(),
+      payload: {
+        toolName: 'admin.disableUser',
+        input: { userId: 'usr_123', reason: 'expired-approve-test' },
+        expiresAt: '2000-01-01T00:00:00.000Z'
+      }
+    });
+    const approvalId = created.json().id as string;
+    const approved = await app.inject({
+      method: 'POST',
+      url: `/v1/approvals/${approvalId}/approve`,
+      headers: operatorHeaders(),
+      payload: {}
+    });
+    expect(approved.statusCode).toBe(400);
+    expect(approved.json().error).toEqual({
+      code: 'APPROVAL_EXPIRED',
+      message: 'Approval is expired',
+      details: { approvalId }
+    });
+    expect(JSON.stringify(approved.json())).not.toContain('approvalTokenHash');
+    expect(await readFile(join(config.configDir, '.tool-boundary', 'audit.jsonl'), 'utf8')).toContain('approval_expired');
+  });
+
   it('maps upstream timeout and error responses', async () => {
     const app = createGatewayServer(await testConfig());
     const timeout = await app.inject({
@@ -255,7 +332,7 @@ describe('gateway', () => {
     expect(second.json().error.code).toBe('IDEMPOTENCY_CONFLICT');
   });
 
-  it('does not replay idempotency records across principals', async () => {
+  it('scopes idempotency records by principal', async () => {
     const app = createGatewayServer(await testConfig());
     const first = await app.inject({
       method: 'POST',
@@ -271,8 +348,8 @@ describe('gateway', () => {
       headers: otherAgentHeaders(),
       payload: { idempotencyKey: 'principal-key', input: { query: 'ada' } }
     });
-    expect(second.statusCode).toBe(400);
-    expect(second.json().error.code).toBe('IDEMPOTENCY_CONFLICT');
+    expect(second.statusCode).toBe(200);
+    expect(second.json().idempotencyReplay).toBeUndefined();
   });
 
   it('does not replay idempotency records after policy changes', async () => {
