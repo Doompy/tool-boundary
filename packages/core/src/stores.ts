@@ -105,20 +105,30 @@ export class FileApprovalStore {
     const file = await this.read();
     const record = file.records.find((candidate) => candidate.toolName === toolName && candidate.approvalTokenHash === tokenHash);
     if (record === undefined) {
-      throw new ToolBoundaryError('APPROVAL_INVALID', 'Approval token is invalid');
+      throw new ToolBoundaryError('APPROVAL_INVALID', 'Approval token is invalid', {
+        details: { approvalTokenHash: tokenHash }
+      });
     }
     if (record.status === 'consumed') {
-      throw new ToolBoundaryError('APPROVAL_ALREADY_CONSUMED', 'Approval token has already been consumed');
+      throw new ToolBoundaryError('APPROVAL_ALREADY_CONSUMED', 'Approval token has already been consumed', {
+        details: { approvalId: record.id, approvalTokenHash: tokenHash }
+      });
     }
     if (approvalIsExpired(record)) {
       await this.markExpired(record.id);
-      throw new ToolBoundaryError('APPROVAL_EXPIRED', 'Approval token is expired');
+      throw new ToolBoundaryError('APPROVAL_EXPIRED', 'Approval token is expired', {
+        details: { approvalId: record.id, approvalTokenHash: tokenHash }
+      });
     }
     if (record.status !== 'approved') {
-      throw new ToolBoundaryError('APPROVAL_INVALID', `Approval is ${record.status}`);
+      throw new ToolBoundaryError('APPROVAL_INVALID', `Approval is ${record.status}`, {
+        details: { approvalId: record.id, approvalTokenHash: tokenHash }
+      });
     }
     if (record.inputHash !== inputHash) {
-      throw new ToolBoundaryError('APPROVAL_INVALID', 'Approval input hash does not match this call');
+      throw new ToolBoundaryError('APPROVAL_INVALID', 'Approval input hash does not match this call', {
+        details: { approvalId: record.id, approvalTokenHash: tokenHash }
+      });
     }
     return record;
   }

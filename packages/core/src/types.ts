@@ -51,6 +51,7 @@ export type ToolDefinition = {
 
 export type ToolCallRequest = {
   readonly input?: unknown;
+  readonly hasInput?: boolean;
   readonly idempotencyKey?: string;
   readonly approvalToken?: string;
   readonly metadata?: Readonly<Record<string, unknown>>;
@@ -112,7 +113,12 @@ export type AuditEventType =
   | 'tool_call_denied'
   | 'approval_required'
   | 'tool_call_succeeded'
-  | 'tool_call_failed';
+  | 'tool_call_failed'
+  | 'approval_requested'
+  | 'approval_approved'
+  | 'approval_rejected'
+  | 'approval_consumed'
+  | 'approval_expired';
 
 export type AuditEvent = {
   readonly id: string;
@@ -136,4 +142,5 @@ export type AuditEvent = {
 export type StoredToolCallResult = {
   readonly executionId: string;
   readonly output: unknown;
+  readonly approvalId?: string;
 };

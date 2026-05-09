@@ -6,7 +6,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { LoadedConfig } from '@tool-boundary/config';
 import { createGatewayServer } from '../src/index.js';
 
-const token = 'local-token';
+const agentToken = 'agent-token';
+const operatorToken = 'operator-token';
 
 let upstream: ReturnType<typeof Fastify> | undefined;
 let upstreamUrl: string;
@@ -37,14 +38,14 @@ describe('gateway', () => {
   it('serves health, tools, and read tool calls', async () => {
     const app = createGatewayServer(await testConfig());
     expect((await app.inject({ method: 'GET', url: '/healthz' })).statusCode).toBe(200);
-    const tools = await app.inject({ method: 'GET', url: '/v1/tools', headers: authHeaders() });
+    const tools = await app.inject({ method: 'GET', url: '/v1/tools', headers: agentHeaders() });
     expect(tools.statusCode).toBe(200);
     expect(JSON.stringify(tools.json())).not.toContain('authorization');
 
     const call = await app.inject({
       method: 'POST',
       url: '/v1/tools/admin.searchUsers/call',
-      headers: authHeaders(),
+      headers: agentHeaders(),
       payload: { input: { query: 'ada' } }
     });
     expect(call.statusCode).toBe(200);
@@ -56,16 +57,24 @@ describe('gateway', () => {
     const requested = await app.inject({
       method: 'POST',
       url: '/v1/tools/admin.disableUser/call',
-      headers: authHeaders(),
+      headers: agentHeaders(),
       payload: { input: { userId: 'usr_123', reason: 'contains-secret-reason' } }
     });
     expect(requested.statusCode).toBe(400);
     const approvalId = requested.json().error.details.approvalId as string;
 
+    const forbiddenApprove = await app.inject({
+      method: 'POST',
+      url: `/v1/approvals/${approvalId}/approve`,
+      headers: agentHeaders(),
+      payload: {}
+    });
+    expect(forbiddenApprove.statusCode).toBe(403);
+
     const approved = await app.inject({
       method: 'POST',
       url: `/v1/approvals/${approvalId}/approve`,
-      headers: authHeaders(),
+      headers: operatorHeaders(),
       payload: {}
     });
     expect(approved.statusCode).toBe(200);
@@ -74,7 +83,7 @@ describe('gateway', () => {
     const missingKey = await app.inject({
       method: 'POST',
       url: '/v1/tools/admin.disableUser/call',
-      headers: authHeaders(),
+      headers: agentHeaders(),
       payload: { approvalToken, input: { userId: 'usr_123', reason: 'contains-secret-reason' } }
     });
     expect(missingKey.statusCode).toBe(400);
@@ -83,7 +92,7 @@ describe('gateway', () => {
     const executed = await app.inject({
       method: 'POST',
       url: '/v1/tools/admin.disableUser/call',
-      headers: authHeaders(),
+      headers: agentHeaders(),
       payload: {
         approvalToken,
         idempotencyKey: 'disable-usr-123',
@@ -93,10 +102,23 @@ describe('gateway', () => {
     expect(executed.statusCode).toBe(200);
     expect(executed.json()).toMatchObject({ ok: true, approvalId });
 
+    const replay = await app.inject({
+      method: 'POST',
+      url: '/v1/tools/admin.disableUser/call',
+      headers: agentHeaders(),
+      payload: {
+        approvalToken,
+        idempotencyKey: 'disable-usr-123',
+        input: { userId: 'usr_123', reason: 'contains-secret-reason' }
+      }
+    });
+    expect(replay.statusCode).toBe(200);
+    expect(replay.json()).toMatchObject({ ok: true, approvalId, idempotencyReplay: true });
+
     const consumed = await app.inject({
       method: 'POST',
       url: '/v1/tools/admin.disableUser/call',
-      headers: authHeaders(),
+      headers: agentHeaders(),
       payload: {
         approvalToken,
         idempotencyKey: 'disable-usr-123-again',
@@ -113,16 +135,16 @@ describe('gateway', () => {
     const requested = await app.inject({
       method: 'POST',
       url: '/v1/tools/admin.disableUser/call',
-      headers: authHeaders(),
+      headers: agentHeaders(),
       payload: { input: { userId: 'usr_123', reason: 'do-not-leak' } }
     });
     const approvalId = requested.json().error.details.approvalId as string;
-    const approved = await app.inject({ method: 'POST', url: `/v1/approvals/${approvalId}/approve`, headers: authHeaders(), payload: {} });
+    const approved = await app.inject({ method: 'POST', url: `/v1/approvals/${approvalId}/approve`, headers: operatorHeaders(), payload: {} });
     const approvalToken = approved.json().approvalToken as string;
     await app.inject({
       method: 'POST',
       url: '/v1/tools/admin.disableUser/call',
-      headers: authHeaders(),
+      headers: agentHeaders(),
       payload: {
         approvalToken,
         idempotencyKey: 'audit-key',
@@ -132,7 +154,7 @@ describe('gateway', () => {
     await app.inject({
       method: 'POST',
       url: '/v1/tools/secrets.echo/call',
-      headers: authHeaders(),
+      headers: agentHeaders(),
       payload: { input: { secret: 'super-secret', value: true } }
     });
 
@@ -140,6 +162,19 @@ describe('gateway', () => {
     expect(audit).not.toContain(approvalToken);
     expect(audit).not.toContain('do-not-leak');
     expect(audit).not.toContain('super-secret');
+
+    const events = audit
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as { readonly eventType: string });
+    expect(events.map((event) => event.eventType)).toEqual(
+      expect.arrayContaining(['approval_required', 'approval_requested', 'approval_approved', 'approval_consumed'])
+    );
+
+    const agentAudit = await app.inject({ method: 'GET', url: '/v1/audit', headers: agentHeaders() });
+    expect(agentAudit.statusCode).toBe(403);
+    const operatorAudit = await app.inject({ method: 'GET', url: '/v1/audit', headers: operatorHeaders() });
+    expect(operatorAudit.statusCode).toBe(200);
   });
 
   it('maps upstream timeout and error responses', async () => {
@@ -147,7 +182,7 @@ describe('gateway', () => {
     const timeout = await app.inject({
       method: 'POST',
       url: '/v1/tools/fixture.slow/call',
-      headers: authHeaders(),
+      headers: agentHeaders(),
       payload: { input: {} }
     });
     expect(timeout.statusCode).toBe(504);
@@ -156,7 +191,7 @@ describe('gateway', () => {
     const error = await app.inject({
       method: 'POST',
       url: '/v1/tools/fixture.error/call',
-      headers: authHeaders(),
+      headers: agentHeaders(),
       payload: { input: {} }
     });
     expect(error.statusCode).toBe(502);
@@ -168,7 +203,7 @@ describe('gateway', () => {
     const first = await app.inject({
       method: 'POST',
       url: '/v1/tools/admin.searchUsers/call',
-      headers: authHeaders(),
+      headers: agentHeaders(),
       payload: { idempotencyKey: 'read-key', input: { query: 'ada' } }
     });
     expect(first.statusCode).toBe(200);
@@ -176,11 +211,53 @@ describe('gateway', () => {
     const second = await app.inject({
       method: 'POST',
       url: '/v1/tools/admin.searchUsers/call',
-      headers: authHeaders(),
+      headers: agentHeaders(),
       payload: { idempotencyKey: 'read-key', input: { query: 'grace' } }
     });
     expect(second.statusCode).toBe(400);
     expect(second.json().error.code).toBe('IDEMPOTENCY_CONFLICT');
+  });
+
+  it('keeps missing input distinct from empty object for idempotency hashing', async () => {
+    const app = createGatewayServer(await testConfig());
+    const first = await app.inject({
+      method: 'POST',
+      url: '/v1/tools/admin.searchUsers/call',
+      headers: agentHeaders(),
+      payload: { idempotencyKey: 'input-shape-key' }
+    });
+    expect(first.statusCode).toBe(200);
+
+    const second = await app.inject({
+      method: 'POST',
+      url: '/v1/tools/admin.searchUsers/call',
+      headers: agentHeaders(),
+      payload: { idempotencyKey: 'input-shape-key', input: {} }
+    });
+    expect(second.statusCode).toBe(400);
+    expect(second.json().error.code).toBe('IDEMPOTENCY_CONFLICT');
+  });
+
+  it('rejects missing runtime policy references instead of falling back silently', async () => {
+    const config = await testConfig();
+    const app = createGatewayServer({
+      ...config,
+      tools: {
+        ...config.tools,
+        'admin.searchUsers': {
+          ...config.tools['admin.searchUsers'],
+          policy: 'missing-policy'
+        }
+      }
+    });
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/tools/admin.searchUsers/call',
+      headers: agentHeaders(),
+      payload: { input: { query: 'ada' } }
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error).toMatchObject({ code: 'CONFIG_INVALID' });
   });
 });
 
@@ -190,7 +267,20 @@ async function testConfig(): Promise<LoadedConfig> {
     server: { host: '127.0.0.1', port: 3050 },
     auth: {
       mode: 'static-token',
-      tokens: [{ name: 'local-agent', tokenEnv: 'TOOL_BOUNDARY_AGENT_TOKEN', token, scopes: ['tools:read', 'tools:call'] }]
+      tokens: [
+        {
+          name: 'local-agent',
+          tokenEnv: 'TOOL_BOUNDARY_AGENT_TOKEN',
+          token: agentToken,
+          scopes: ['tools:read', 'tools:call', 'approvals:request']
+        },
+        {
+          name: 'local-operator',
+          tokenEnv: 'TOOL_BOUNDARY_OPERATOR_TOKEN',
+          token: operatorToken,
+          scopes: ['tools:read', 'approvals:read', 'approvals:approve', 'approvals:reject', 'audit:read']
+        }
+      ]
     },
     audit: {
       sink: 'jsonl',
@@ -261,9 +351,16 @@ async function testConfig(): Promise<LoadedConfig> {
   };
 }
 
-function authHeaders(): Record<string, string> {
+function agentHeaders(): Record<string, string> {
   return {
-    authorization: `Bearer ${token}`,
+    authorization: `Bearer ${agentToken}`,
+    'content-type': 'application/json'
+  };
+}
+
+function operatorHeaders(): Record<string, string> {
+  return {
+    authorization: `Bearer ${operatorToken}`,
     'content-type': 'application/json'
   };
 }

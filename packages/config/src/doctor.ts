@@ -1,4 +1,10 @@
-import type { ToolDefinition } from '@tool-boundary/core';
+import {
+  defaultPolicy,
+  requiresApproval,
+  requiresIdempotency,
+  type ToolDefinition,
+  type ToolPolicyDefinition
+} from '@tool-boundary/core';
 import type { UnresolvedLoadedConfig } from './load-config.js';
 
 export type DoctorDiagnostic = {
@@ -22,20 +28,21 @@ export function doctorConfig(config: UnresolvedLoadedConfig, env: NodeJS.Process
   }
 
   for (const tool of Object.values(config.tools)) {
-    diagnostics.push(...doctorTool(tool, config.server.host));
+    diagnostics.push(...doctorTool(tool, config));
   }
 
   return diagnostics;
 }
 
-function doctorTool(tool: ToolDefinition, serverHost: string): readonly DoctorDiagnostic[] {
+function doctorTool(tool: ToolDefinition, config: UnresolvedLoadedConfig): readonly DoctorDiagnostic[] {
   const diagnostics: DoctorDiagnostic[] = [];
+  const policy = resolvePolicyForDoctor(config, tool, diagnostics);
 
-  if (tool.mode === 'mutate' && tool.approvalRequired !== true) {
+  if (tool.mode === 'mutate' && !requiresApproval(tool, policy)) {
     diagnostics.push({
       severity: 'error',
       code: 'MUTATE_WITHOUT_APPROVAL',
-      message: 'Mutating tool must set approvalRequired: true',
+      message: 'Mutating tool must require approval through tool or policy config',
       toolName: tool.name
     });
   }
@@ -94,11 +101,11 @@ function doctorTool(tool: ToolDefinition, serverHost: string): readonly DoctorDi
     });
   }
 
-  if (tool.mode === 'mutate' && tool.idempotency?.required !== true) {
+  if (tool.mode === 'mutate' && !requiresIdempotency(tool, policy)) {
     diagnostics.push({
       severity: 'error',
       code: 'MUTATE_WITHOUT_IDEMPOTENCY',
-      message: 'Mutating tool must require idempotency',
+      message: 'Mutating tool must require idempotency through tool or policy config',
       toolName: tool.name
     });
   }
@@ -112,7 +119,7 @@ function doctorTool(tool: ToolDefinition, serverHost: string): readonly DoctorDi
     });
   }
 
-  if (tool.target.type === 'http' && serverIsPublic(serverHost) && upstreamIsLocalhost(tool.target.url)) {
+  if (tool.target.type === 'http' && serverIsPublic(config.server.host) && upstreamIsLocalhost(tool.target.url)) {
     diagnostics.push({
       severity: 'warning',
       code: 'PUBLIC_SERVER_TO_LOCALHOST_UPSTREAM',
@@ -122,6 +129,23 @@ function doctorTool(tool: ToolDefinition, serverHost: string): readonly DoctorDi
   }
 
   return diagnostics;
+}
+
+function resolvePolicyForDoctor(
+  config: UnresolvedLoadedConfig,
+  tool: ToolDefinition,
+  diagnostics: DoctorDiagnostic[]
+): ToolPolicyDefinition {
+  if (tool.policy === undefined) return config.policies.default ?? defaultPolicy;
+  const policy = config.policies[tool.policy];
+  if (policy !== undefined) return policy;
+  diagnostics.push({
+    severity: 'error',
+    code: 'POLICY_NOT_FOUND',
+    message: `Policy ${tool.policy} referenced by ${tool.name} was not found`,
+    toolName: tool.name
+  });
+  return config.policies.default ?? defaultPolicy;
 }
 
 function isHighRisk(tool: ToolDefinition): boolean {

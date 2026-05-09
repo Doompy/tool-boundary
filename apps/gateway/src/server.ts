@@ -64,7 +64,7 @@ export function createGatewayServer(config: LoadedConfig, options: GatewayServer
     const policy = resolvePolicy(config, tool);
     const executionId = randomUUID();
     const input = body.input;
-    const inputHash = hashUnknown(input ?? {});
+    const inputHash = inputHashForToolCall(body);
 
     await auditSink.write(
       buildAuditEvent({
@@ -87,16 +87,72 @@ export function createGatewayServer(config: LoadedConfig, options: GatewayServer
       return sendError(reply, new ToolBoundaryError('TOOL_SCHEMA_VALIDATION_FAILED', 'Input schema validation failed', { details: validation.details }));
     }
 
+    const preliminaryDecision = evaluatePolicy({ tool, policy, hasValidApproval: false });
+    if (preliminaryDecision.verdict === 'deny') {
+      await writeDeniedAudit(auditSink, tool, executionId, principal, input, auditPolicy, preliminaryDecision);
+      return sendError(reply, new ToolBoundaryError('POLICY_DENIED', preliminaryDecision.reason));
+    }
+
+    if (body.idempotencyKey !== undefined) {
+      const idempotency = await idempotencyStore.check(tool.name, body.idempotencyKey, inputHash);
+      if (idempotency.status === 'conflict') {
+        await writeDeniedAudit(auditSink, tool, executionId, principal, input, auditPolicy, {
+          verdict: 'deny',
+          reason: 'Idempotency key conflicts with a different input'
+        });
+        return sendError(reply, new ToolBoundaryError('IDEMPOTENCY_CONFLICT', 'Idempotency key conflicts with a different input'));
+      }
+      if (idempotency.status === 'replay') {
+        const replayResult: ToolCallResult = {
+          ok: true,
+          executionId: idempotency.result.executionId,
+          toolName: tool.name,
+          mode: tool.mode,
+          output: idempotency.result.output,
+          approvalId: idempotency.result.approvalId,
+          idempotencyReplay: true
+        };
+        await auditSink.write(
+          buildAuditEvent({
+            eventType: 'tool_call_succeeded',
+            tool,
+            executionId,
+            userId: principal.name,
+            output: replayResult.output,
+            approvalId: replayResult.approvalId,
+            idempotencyKey: body.idempotencyKey,
+            auditPolicy
+          })
+        );
+        return reply.send(replayResult);
+      }
+    }
+
     let approval: ApprovalRecord | undefined;
     if (body.approvalToken !== undefined) {
       try {
         approval = await approvalStore.findApprovedByToken(tool.name, inputHash, body.approvalToken);
       } catch (error) {
+        const normalized = toToolBoundaryError(error);
+        if (normalized.code === 'APPROVAL_EXPIRED') {
+          await auditSink.write(
+            buildAuditEvent({
+              eventType: 'approval_expired',
+              tool,
+              executionId,
+              userId: principal.name,
+              input,
+              approvalId: getApprovalIdFromDetails(normalized.details),
+              approvalTokenHash: getApprovalTokenHashFromDetails(normalized.details),
+              auditPolicy
+            })
+          );
+        }
         await writeDeniedAudit(auditSink, tool, executionId, principal, input, auditPolicy, {
           verdict: 'deny',
-          reason: toToolBoundaryError(error).message
+          reason: normalized.message
         });
-        return sendError(reply, toToolBoundaryError(error));
+        return sendError(reply, normalized);
       }
     }
 
@@ -124,6 +180,17 @@ export function createGatewayServer(config: LoadedConfig, options: GatewayServer
           auditPolicy
         })
       );
+      await auditSink.write(
+        buildAuditEvent({
+          eventType: 'approval_requested',
+          tool,
+          executionId,
+          userId: principal.name,
+          input,
+          approvalId: approvalRecord.id,
+          auditPolicy
+        })
+      );
       return sendError(
         reply,
         new ToolBoundaryError('APPROVAL_REQUIRED', decision.reason, {
@@ -141,43 +208,20 @@ export function createGatewayServer(config: LoadedConfig, options: GatewayServer
       return sendError(reply, new ToolBoundaryError('IDEMPOTENCY_KEY_REQUIRED', 'Idempotency key is required'));
     }
 
-    if (body.idempotencyKey !== undefined) {
-      const idempotency = await idempotencyStore.check(tool.name, body.idempotencyKey, inputHash);
-      if (idempotency.status === 'conflict') {
-        await writeDeniedAudit(auditSink, tool, executionId, principal, input, auditPolicy, {
-          verdict: 'deny',
-          reason: 'Idempotency key conflicts with a different input'
-        });
-        return sendError(reply, new ToolBoundaryError('IDEMPOTENCY_CONFLICT', 'Idempotency key conflicts with a different input'));
-      }
-      if (idempotency.status === 'replay') {
-        const replayResult: ToolCallResult = {
-          ok: true,
-          executionId: idempotency.result.executionId,
-          toolName: tool.name,
-          mode: tool.mode,
-          output: idempotency.result.output,
-          approvalId: approval?.id,
-          idempotencyReplay: true
-        };
-        await auditSink.write(
-          buildAuditEvent({
-            eventType: 'tool_call_succeeded',
-            tool,
-            executionId,
-            userId: principal.name,
-            output: replayResult.output,
-            approvalId: approval?.id,
-            idempotencyKey: body.idempotencyKey,
-            auditPolicy
-          })
-        );
-        return reply.send(replayResult);
-      }
-    }
-
     if (approval !== undefined) {
-      await approvalStore.consume(approval.id);
+      const consumed = await approvalStore.consume(approval.id);
+      await auditSink.write(
+        buildAuditEvent({
+          eventType: 'approval_consumed',
+          tool,
+          executionId,
+          userId: principal.name,
+          input,
+          approvalId: consumed.id,
+          approvalTokenHash: body.approvalToken === undefined ? undefined : hashApprovalToken(body.approvalToken),
+          auditPolicy
+        })
+      );
     }
 
     await auditSink.write(
@@ -198,7 +242,7 @@ export function createGatewayServer(config: LoadedConfig, options: GatewayServer
     try {
       const output = await executeToolTarget(tool, input);
       if (body.idempotencyKey !== undefined) {
-        await idempotencyStore.record(tool.name, body.idempotencyKey, inputHash, { executionId, output });
+        await idempotencyStore.record(tool.name, body.idempotencyKey, inputHash, { executionId, output, approvalId: approval?.id });
       }
       await auditSink.write(
         buildAuditEvent({
@@ -239,39 +283,71 @@ export function createGatewayServer(config: LoadedConfig, options: GatewayServer
   });
 
   app.get('/v1/approvals', async (request, reply) => {
-    authenticate(request, config, 'tools:read');
+    authenticate(request, config, 'approvals:read');
     await reply.send({ approvals: await approvalStore.list() });
   });
 
   app.post('/v1/approvals', async (request, reply) => {
-    const principal = authenticate(request, config, 'tools:call');
+    const principal = authenticate(request, config, 'approvals:request');
     const body = parseApprovalCreateBody(request.body);
     const tool = getTool(config, body.toolName);
+    const auditPolicy = resolveAuditPolicy(config, tool);
     const record = await approvalStore.create({
       toolName: tool.name,
-      inputHash: hashUnknown(body.input ?? {}),
+      inputHash: inputHashForApprovalCreate(body),
       requestedBy: principal.name,
       resourceIds: body.resourceIds,
       dryRunHash: body.dryRunHash,
       expiresAt: body.expiresAt
     });
+    await auditSink.write(
+      buildAuditEvent({
+        eventType: 'approval_requested',
+        tool,
+        userId: principal.name,
+        input: body.input,
+        approvalId: record.id,
+        auditPolicy
+      })
+    );
     await reply.code(201).send(record);
   });
 
   app.post('/v1/approvals/:id/approve', async (request, reply) => {
-    const principal = authenticate(request, config, 'tools:call');
+    const principal = authenticate(request, config, 'approvals:approve');
     const { record, token } = await approvalStore.approve(getIdParam(request), principal.name);
+    const tool = getTool(config, record.toolName);
+    await auditSink.write(
+      buildAuditEvent({
+        eventType: 'approval_approved',
+        tool,
+        userId: principal.name,
+        approvalId: record.id,
+        approvalTokenHash: record.approvalTokenHash,
+        auditPolicy: resolveAuditPolicy(config, tool)
+      })
+    );
     await reply.send({ approval: record, approvalToken: token });
   });
 
   app.post('/v1/approvals/:id/reject', async (request, reply) => {
-    authenticate(request, config, 'tools:call');
+    const principal = authenticate(request, config, 'approvals:reject');
     const record = await approvalStore.reject(getIdParam(request));
+    const tool = getTool(config, record.toolName);
+    await auditSink.write(
+      buildAuditEvent({
+        eventType: 'approval_rejected',
+        tool,
+        userId: principal.name,
+        approvalId: record.id,
+        auditPolicy: resolveAuditPolicy(config, tool)
+      })
+    );
     await reply.send(record);
   });
 
   app.get('/v1/audit', async (request, reply) => {
-    authenticate(request, config, 'tools:read');
+    authenticate(request, config, 'audit:read');
     await reply.send({ events: await auditSink.readAll() });
   });
 
@@ -318,7 +394,11 @@ function getTool(config: LoadedConfig, name: string): ToolDefinition {
 
 function resolvePolicy(config: LoadedConfig, tool: ToolDefinition): ToolPolicyDefinition {
   if (tool.policy !== undefined) {
-    return config.policies[tool.policy] ?? defaultPolicy;
+    const policy = config.policies[tool.policy];
+    if (policy === undefined) {
+      throw new ToolBoundaryError('CONFIG_INVALID', `Policy ${tool.policy} referenced by ${tool.name} was not found`);
+    }
+    return policy;
   }
   return config.policies.default ?? defaultPolicy;
 }
@@ -374,6 +454,7 @@ function parseToolCallRequest(body: unknown): ToolCallRequest {
   const value = body as Record<string, unknown>;
   return {
     input: value.input,
+    hasInput: Object.hasOwn(value, 'input'),
     idempotencyKey: typeof value.idempotencyKey === 'string' ? value.idempotencyKey : undefined,
     approvalToken: typeof value.approvalToken === 'string' ? value.approvalToken : undefined,
     metadata: isRecord(value.metadata) ? value.metadata : undefined
@@ -383,6 +464,7 @@ function parseToolCallRequest(body: unknown): ToolCallRequest {
 function parseApprovalCreateBody(body: unknown): {
   readonly toolName: string;
   readonly input?: unknown;
+  readonly hasInput: boolean;
   readonly resourceIds?: readonly string[];
   readonly dryRunHash?: string;
   readonly expiresAt?: string;
@@ -393,10 +475,19 @@ function parseApprovalCreateBody(body: unknown): {
   return {
     toolName: body.toolName,
     input: body.input,
+    hasInput: Object.hasOwn(body, 'input'),
     resourceIds: Array.isArray(body.resourceIds) && body.resourceIds.every((item) => typeof item === 'string') ? body.resourceIds : undefined,
     dryRunHash: typeof body.dryRunHash === 'string' ? body.dryRunHash : undefined,
     expiresAt: typeof body.expiresAt === 'string' ? body.expiresAt : undefined
   };
+}
+
+function inputHashForToolCall(body: ToolCallRequest): string {
+  return hashUnknown(body.hasInput === true ? { hasInput: true, input: body.input } : { hasInput: false });
+}
+
+function inputHashForApprovalCreate(body: { readonly hasInput: boolean; readonly input?: unknown }): string {
+  return hashUnknown(body.hasInput ? { hasInput: true, input: body.input } : { hasInput: false });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -473,4 +564,12 @@ async function sendError(reply: FastifyReply, error: ToolBoundaryError, executio
       details: error.details
     }
   } satisfies ToolCallResult);
+}
+
+function getApprovalIdFromDetails(details: unknown): string | undefined {
+  return isRecord(details) && typeof details.approvalId === 'string' ? details.approvalId : undefined;
+}
+
+function getApprovalTokenHashFromDetails(details: unknown): string | undefined {
+  return isRecord(details) && typeof details.approvalTokenHash === 'string' ? details.approvalTokenHash : undefined;
 }

@@ -72,4 +72,31 @@ describe('config loader', () => {
     expect(diagnostics.map((diagnostic) => diagnostic.code)).toContain('MUTATE_WITHOUT_IDEMPOTENCY');
     expect(diagnostics.map((diagnostic) => diagnostic.code)).toContain('STATIC_TOKEN_ENV_MISSING');
   });
+
+  it('uses runtime policy rules when checking mutate approval and idempotency', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tool-boundary-config-'));
+    const path = join(dir, 'tool-boundary.config.yaml');
+    await writeFile(
+      path,
+      validConfig
+        .replace(
+          'policies:\n  default:\n    allowedModes: [read, draft, dryRun]',
+          'policies:\n  default:\n    allowedModes: [read, draft, dryRun]\n  mutating:\n    allowedModes: [read, draft, dryRun, mutate]\n    requireApprovalForModes: [mutate]\n    requireIdempotencyForModes: [mutate]'
+        )
+        .replace('mode: read', 'mode: mutate\n    policy: mutating')
+    );
+    const config = await loadConfigUnresolved(path);
+    const diagnostics = doctorConfig(config, { TOOL_BOUNDARY_AGENT_TOKEN: 'token' });
+    expect(diagnostics.map((diagnostic) => diagnostic.code)).not.toContain('MUTATE_WITHOUT_APPROVAL');
+    expect(diagnostics.map((diagnostic) => diagnostic.code)).not.toContain('MUTATE_WITHOUT_IDEMPOTENCY');
+  });
+
+  it('reports missing policy references through doctor', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tool-boundary-config-'));
+    const path = join(dir, 'tool-boundary.config.yaml');
+    await writeFile(path, validConfig.replace('mode: read', 'mode: read\n    policy: missing-policy'));
+    const config = await loadConfigUnresolved(path);
+    const diagnostics = doctorConfig(config, { TOOL_BOUNDARY_AGENT_TOKEN: 'token' });
+    expect(diagnostics.map((diagnostic) => diagnostic.code)).toContain('POLICY_NOT_FOUND');
+  });
 });

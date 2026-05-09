@@ -10,6 +10,7 @@ Instead of wiring policy, approval, audit, redaction, and idempotency into every
 - Static bearer-token auth.
 - HTTP POST upstream tools.
 - Deterministic policy checks.
+- Minimal JSON Schema subset validation for input schemas: `type`, `required`, and `properties`.
 - Local approval queue.
 - JSONL audit sink.
 - Audit redaction, hashing, and structural summaries.
@@ -42,7 +43,8 @@ node packages/cli/dist/index.js init
 Run a gateway:
 
 ```bash
-$env:TOOL_BOUNDARY_AGENT_TOKEN="local-token"
+$env:TOOL_BOUNDARY_AGENT_TOKEN="agent-token"
+$env:TOOL_BOUNDARY_OPERATOR_TOKEN="operator-token"
 node packages/cli/dist/index.js serve --config ./tool-boundary.config.yaml
 ```
 
@@ -59,6 +61,7 @@ node packages/cli/dist/index.js serve --config ./tool-boundary.config.yaml
 - Audit payload redaction runs before hashing or summary generation.
 - Default policy allows only `read`, `draft`, and `dryRun`.
 - Mutating calls can require approval and idempotency keys.
+- Agent and operator tokens should use separate scopes: agents call tools and request approvals, while operators approve/reject and read audit.
 - Output summaries are structural and do not serialize full objects by default.
 
 ## Local Demo

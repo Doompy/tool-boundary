@@ -10,6 +10,15 @@ auth:
       scopes:
         - tools:read
         - tools:call
+        - approvals:request
+    - name: local-operator
+      tokenEnv: TOOL_BOUNDARY_OPERATOR_TOKEN
+      scopes:
+        - tools:read
+        - approvals:read
+        - approvals:approve
+        - approvals:reject
+        - audit:read
 
 audit:
   sink: jsonl
