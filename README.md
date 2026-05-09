@@ -1,14 +1,17 @@
 # ToolBoundary
 
-ToolBoundary is a self-hosted action gateway for AI agents.
+ToolBoundary is a self-hosted action firewall for AI agents.
 
 It sits between agents and tools to enforce approval, policy, audit, redaction, output validation, and idempotency before side effects happen.
+
+MCP makes tools easy to connect. ToolBoundary makes them safe to run.
 
 ## MVP Scope
 
 - Config-based tool registry.
 - Static bearer-token auth.
 - HTTP POST upstream tools.
+- MCP stdio upstream tools through explicit config.
 - Deterministic policy checks.
 - JSON Schema validation for tool inputs through AJV.
 - Optional output schema validation in `enforce` or `auditOnly` mode.
@@ -63,6 +66,14 @@ $env:TOOL_BOUNDARY_AGENT_TOKEN="agent-token"
 node packages/cli/dist/index.js mcp:serve --config ./tool-boundary.config.yaml --token-env TOOL_BOUNDARY_AGENT_TOKEN
 ```
 
+Proxy configured MCP upstream tools through the same boundary:
+
+```bash
+$env:TOOL_BOUNDARY_UPSTREAM_TOKEN="fixture-token"
+npm run build --workspace tool-boundary-basic-mcp-proxy
+node packages/cli/dist/index.js mcp:proxy --config ./examples/basic-mcp-proxy/tool-boundary.config.yaml --token-env TOOL_BOUNDARY_AGENT_TOKEN
+```
+
 Run doctor in CI:
 
 ```bash
@@ -73,7 +84,7 @@ node packages/cli/dist/index.js doctor --config ./tool-boundary.config.yaml --fo
 
 - `packages/core` contains domain types, policy, redaction, approvals, audit helpers, file stores, and SQLite stores.
 - `packages/config` loads YAML/JSON config and produces doctor diagnostics.
-- `apps/gateway` exposes the Fastify HTTP API, MCP stdio server, and shared tool call service.
+- `apps/gateway` exposes the Fastify HTTP API, MCP stdio server, MCP upstream proxy executor, and shared tool call service.
 - `packages/cli` exposes local developer commands.
 
 ## Security Model

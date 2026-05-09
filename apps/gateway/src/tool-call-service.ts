@@ -22,8 +22,8 @@ import {
   type ToolPolicyDefinition
 } from '@tool-boundary/core';
 import type { LoadedConfig } from '@tool-boundary/config';
-import { executeToolTarget } from './upstream/http-tool.js';
 import type { RuntimeStores } from './runtime.js';
+import { executeConfiguredToolTarget } from './upstream/executor.js';
 
 export type Principal = {
   readonly name: string;
@@ -46,7 +46,7 @@ export class ToolCallService {
     private readonly stores: RuntimeStores,
     options: { readonly execute?: ToolExecutor } = {}
   ) {
-    this.execute = options.execute ?? executeToolTarget;
+    this.execute = options.execute ?? ((tool, input) => executeConfiguredToolTarget(this.config, tool, input));
   }
 
   async callTool(toolName: string, body: ToolCallRequest, principal: Principal): Promise<ToolCallServiceResponse> {

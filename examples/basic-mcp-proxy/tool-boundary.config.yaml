@@ -1,0 +1,111 @@
+server:
+  host: 127.0.0.1
+  port: 3051
+
+auth:
+  mode: static-token
+  tokens:
+    - name: local-agent
+      tokenEnv: TOOL_BOUNDARY_AGENT_TOKEN
+      scopes: [tools:read, tools:call, approvals:request]
+    - name: local-operator
+      tokenEnv: TOOL_BOUNDARY_OPERATOR_TOKEN
+      scopes: [tools:read, approvals:read, approvals:approve, approvals:reject, audit:read]
+
+storage:
+  type: sqlite
+  path: .tool-boundary/toolboundary.db
+
+mcp:
+  upstreams:
+    local-admin:
+      transport: stdio
+      command: node
+      args: ["./dist/upstream-server.js"]
+      cwd: "."
+      envFrom:
+        API_TOKEN: TOOL_BOUNDARY_UPSTREAM_TOKEN
+
+policies:
+  approved-mutate:
+    allowedModes: [read, mutate]
+    requireApprovalForModes: [mutate]
+    requireIdempotencyForModes: [mutate]
+
+audit:
+  defaults:
+    input: redacted
+    output: summary
+    error: summary
+    redactPaths:
+      - /reasonCode
+
+tools:
+  admin.searchUsers:
+    version: 2026-05-10.1
+    description: Search users through an upstream MCP server.
+    mode: read
+    riskLevel: low
+    inputSchema:
+      type: object
+      properties:
+        query:
+          type: string
+      required: [query]
+    outputSchema:
+      type: object
+      properties:
+        users:
+          type: array
+      required: [users]
+    outputValidation:
+      enabled: true
+      mode: enforce
+    target:
+      type: mcp
+      upstream: local-admin
+      toolName: searchUsers
+      timeoutMs: 5000
+
+  admin.disableUser:
+    version: 2026-05-10.1
+    description: Disable a user through an upstream MCP server.
+    mode: mutate
+    riskLevel: high
+    policy: approved-mutate
+    inputSchema:
+      type: object
+      properties:
+        userId:
+          type: string
+        reasonCode:
+          type: string
+      required: [userId, reasonCode]
+    outputSchema:
+      type: object
+      properties:
+        disabled:
+          type: boolean
+        userId:
+          type: string
+      required: [disabled, userId]
+    outputValidation:
+      enabled: true
+      mode: enforce
+    approval:
+      previewPaths:
+        - /userId
+        - /reasonCode
+    idempotency:
+      required: true
+    audit:
+      input: redacted
+      output: summary
+      error: summary
+      redactPaths:
+        - /reasonCode
+    target:
+      type: mcp
+      upstream: local-admin
+      toolName: disableUser
+      timeoutMs: 5000

@@ -47,6 +47,13 @@ const mockTargetSchema = z.object({
   result: z.unknown()
 });
 
+const mcpTargetSchema = z.object({
+  type: z.literal('mcp'),
+  upstream: z.string().min(1),
+  toolName: z.string().min(1),
+  timeoutMs: z.number().int().positive().optional()
+});
+
 const storageSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('file')
@@ -57,6 +64,15 @@ const storageSchema = z.discriminatedUnion('type', [
   })
 ]);
 
+const mcpUpstreamSchema = z.object({
+  transport: z.string().default('stdio'),
+  command: z.string().min(1),
+  args: z.array(z.string()).optional(),
+  cwd: z.string().optional(),
+  env: z.record(z.string(), z.string()).optional(),
+  envFrom: z.record(z.string(), z.string()).optional()
+});
+
 export const rawToolDefinitionSchema = z.object({
   version: z.string().optional(),
   description: z.string().optional(),
@@ -66,7 +82,7 @@ export const rawToolDefinitionSchema = z.object({
   inputSchema: z.unknown().optional(),
   outputSchema: z.unknown().optional(),
   outputValidation: outputValidationPolicySchema.optional(),
-  target: z.discriminatedUnion('type', [httpTargetSchema, mockTargetSchema]),
+  target: z.discriminatedUnion('type', [httpTargetSchema, mockTargetSchema, mcpTargetSchema]),
   policy: z.string().optional(),
   approval: toolApprovalPolicySchema.optional(),
   audit: auditPayloadPolicySchema.optional(),
@@ -101,6 +117,11 @@ export const rawConfigSchema = z.object({
     })
     .default({ sink: 'jsonl', path: '.tool-boundary/audit.jsonl', defaults: {} }),
   storage: storageSchema.default({ type: 'file' }),
+  mcp: z
+    .object({
+      upstreams: z.record(z.string(), mcpUpstreamSchema).default({})
+    })
+    .default({ upstreams: {} }),
   policies: z.record(z.string(), toolPolicySchema).default({}),
   tools: z.record(z.string(), rawToolDefinitionSchema)
 });

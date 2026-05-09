@@ -74,6 +74,27 @@ describe('config loader', () => {
     expect(config.tools['admin.searchUsers']?.outputValidation).toEqual({ enabled: true, mode: 'auditOnly' });
   });
 
+  it('loads MCP upstreams and MCP tool targets', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tool-boundary-config-'));
+    const path = join(dir, 'tool-boundary.config.yaml');
+    await writeFile(
+      path,
+      validConfig
+        .replace(
+          'policies:',
+          'mcp:\n  upstreams:\n    local-admin:\n      transport: stdio\n      command: node\n      args: ["./dist/upstream-server.js"]\n      cwd: "."\n      envFrom:\n        API_TOKEN: TOOL_BOUNDARY_UPSTREAM_TOKEN\npolicies:'
+        )
+        .replace('target:\n      type: mock\n      result:\n        ok: true', 'target:\n      type: mcp\n      upstream: local-admin\n      toolName: searchUsers\n      timeoutMs: 5000')
+    );
+    const config = await loadConfig(path, {
+      env: {
+        TOOL_BOUNDARY_AGENT_TOKEN: 'token'
+      }
+    });
+    expect(config.mcp.upstreams['local-admin']?.command).toBe('node');
+    expect(config.tools['admin.searchUsers']?.target).toMatchObject({ type: 'mcp', upstream: 'local-admin', toolName: 'searchUsers' });
+  });
+
   it('rejects invalid storage config', () => {
     expect(() => parseConfigContent(validConfig.replace('policies:', 'storage:\n  type: postgres\npolicies:'))).toThrow();
   });
@@ -133,6 +154,25 @@ describe('config loader', () => {
     const config = await loadConfigUnresolved(path);
     const diagnostics = doctorConfig(config, { TOOL_BOUNDARY_AGENT_TOKEN: 'token' });
     expect(diagnostics.map((diagnostic) => diagnostic.code)).toContain('OUTPUT_VALIDATION_WITHOUT_SCHEMA');
+  });
+
+  it('reports MCP upstream configuration diagnostics', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tool-boundary-config-'));
+    const path = join(dir, 'tool-boundary.config.yaml');
+    await writeFile(
+      path,
+      validConfig
+        .replace(
+          'policies:',
+          'mcp:\n  upstreams:\n    local-admin:\n      transport: websocket\n      command: node\n      envFrom:\n        API_TOKEN: TOOL_BOUNDARY_UPSTREAM_TOKEN\npolicies:'
+        )
+        .replace('target:\n      type: mock\n      result:\n        ok: true', 'target:\n      type: mcp\n      upstream: missing-admin\n      toolName: searchUsers')
+    );
+    const config = await loadConfigUnresolved(path);
+    const diagnostics = doctorConfig(config, { TOOL_BOUNDARY_AGENT_TOKEN: 'token' });
+    expect(diagnostics.map((diagnostic) => diagnostic.code)).toEqual(
+      expect.arrayContaining(['MCP_UPSTREAM_UNSUPPORTED_TRANSPORT', 'MCP_UPSTREAM_ENV_MISSING', 'MCP_UPSTREAM_NOT_FOUND'])
+    );
   });
 
   it('uses runtime policy rules when checking mutate approval and idempotency', async () => {

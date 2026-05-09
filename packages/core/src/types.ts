@@ -11,6 +11,12 @@ export type ToolTarget =
       readonly timeoutMs?: number;
     }
   | {
+      readonly type: 'mcp';
+      readonly upstream: string;
+      readonly toolName: string;
+      readonly timeoutMs?: number;
+    }
+  | {
       readonly type: 'mock';
       readonly result: unknown;
     };

@@ -20,6 +20,7 @@ export function doctorConfig(config: UnresolvedLoadedConfig, env: NodeJS.Process
   const diagnostics: DoctorDiagnostic[] = [];
 
   diagnostics.push(...doctorStaticTokens(config, env));
+  diagnostics.push(...doctorMcpUpstreams(config, env));
 
   for (const tool of Object.values(config.tools)) {
     diagnostics.push(...doctorTool(tool, config));
@@ -99,6 +100,29 @@ function doctorStaticTokens(config: UnresolvedLoadedConfig, env: NodeJS.ProcessE
   return diagnostics;
 }
 
+function doctorMcpUpstreams(config: UnresolvedLoadedConfig, env: NodeJS.ProcessEnv): readonly DoctorDiagnostic[] {
+  const diagnostics: DoctorDiagnostic[] = [];
+  for (const [name, upstream] of Object.entries(config.mcp.upstreams)) {
+    if (upstream.transport !== 'stdio') {
+      diagnostics.push({
+        severity: 'error',
+        code: 'MCP_UPSTREAM_UNSUPPORTED_TRANSPORT',
+        message: `MCP upstream ${name} uses unsupported transport ${upstream.transport}`
+      });
+    }
+    for (const [targetEnv, sourceEnv] of Object.entries(upstream.envFrom ?? {})) {
+      if (env[sourceEnv] === undefined || env[sourceEnv]?.length === 0) {
+        diagnostics.push({
+          severity: 'error',
+          code: 'MCP_UPSTREAM_ENV_MISSING',
+          message: `MCP upstream ${name} maps ${targetEnv} from missing env ${sourceEnv}`
+        });
+      }
+    }
+  }
+  return diagnostics;
+}
+
 function doctorTool(tool: ToolDefinition, config: UnresolvedLoadedConfig): readonly DoctorDiagnostic[] {
   const diagnostics: DoctorDiagnostic[] = [];
   const policy = resolvePolicyForDoctor(config, tool, diagnostics);
@@ -152,7 +176,7 @@ function doctorTool(tool: ToolDefinition, config: UnresolvedLoadedConfig): reado
     diagnostics.push({
       severity: 'warning',
       code: 'TOOL_WITHOUT_OUTPUT_SCHEMA',
-      message: 'Tool should include an output schema placeholder; runtime output validation is not enforced yet',
+      message: 'Tool should include an output schema so opt-in output validation can be enabled',
       toolName: tool.name
     });
   }
@@ -207,6 +231,15 @@ function doctorTool(tool: ToolDefinition, config: UnresolvedLoadedConfig): reado
       severity: 'warning',
       code: 'PUBLIC_SERVER_TO_LOCALHOST_UPSTREAM',
       message: 'Public gateway host points to a localhost upstream URL',
+      toolName: tool.name
+    });
+  }
+
+  if (tool.target.type === 'mcp' && config.mcp.upstreams[tool.target.upstream] === undefined) {
+    diagnostics.push({
+      severity: 'error',
+      code: 'MCP_UPSTREAM_NOT_FOUND',
+      message: `MCP target references missing upstream ${tool.target.upstream}`,
       toolName: tool.name
     });
   }

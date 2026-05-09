@@ -31,6 +31,8 @@ export async function runCli(argv: readonly string[], io: Partial<CliIo> = {}): 
         return await serveCommand(argv.slice(1), fullIo);
       case 'mcp:serve':
         return await mcpServeCommand(argv.slice(1), fullIo);
+      case 'mcp:proxy':
+        return await mcpProxyCommand(argv.slice(1), fullIo);
       case 'doctor':
         return await doctorCommand(argv.slice(1), fullIo);
       case 'tools:list':
@@ -78,6 +80,19 @@ async function mcpServeCommand(argv: readonly string[], io: CliIo): Promise<numb
   const tokenEnv = getOption(argv, '--token-env');
   if (tokenEnv === undefined) throw new ToolBoundaryError('CONFIG_INVALID', 'mcp:serve requires --token-env');
   const config = await loadConfig(resolveConfigPath(argv, io.cwd), { env: io.env });
+  const principal = resolveMcpPrincipal(config, tokenEnv, io.env);
+  await startMcpServer(config, { principal });
+  return 0;
+}
+
+async function mcpProxyCommand(argv: readonly string[], io: CliIo): Promise<number> {
+  const tokenEnv = getOption(argv, '--token-env');
+  if (tokenEnv === undefined) throw new ToolBoundaryError('CONFIG_INVALID', 'mcp:proxy requires --token-env');
+  const config = await loadConfig(resolveConfigPath(argv, io.cwd), { env: io.env });
+  const hasMcpTarget = Object.values(config.tools).some((tool) => tool.target.type === 'mcp');
+  if (!hasMcpTarget) {
+    throw new ToolBoundaryError('CONFIG_INVALID', 'mcp:proxy requires at least one configured MCP target');
+  }
   const principal = resolveMcpPrincipal(config, tokenEnv, io.env);
   await startMcpServer(config, { principal });
   return 0;
@@ -165,6 +180,7 @@ Commands:
   init [--config path]
   serve --config path
   mcp:serve --config path --token-env env
+  mcp:proxy --config path --token-env env
   doctor --config path [--format text|json|sarif] [--ci]
   tools:list --config path
   approvals:list --config path

@@ -10,8 +10,8 @@
     "examples/*"
   ],
   "scripts": {
-    "build": "npm run build --workspace @tool-boundary/core && npm run build --workspace @tool-boundary/config && npm run build --workspace tool-boundary-gateway && npm run build --workspace @tool-boundary/cli && npm run build --workspace tool-boundary-basic-http-tool",
-    "typecheck": "npm run typecheck --workspace @tool-boundary/core && npm run typecheck --workspace @tool-boundary/config && npm run typecheck --workspace tool-boundary-gateway && npm run typecheck --workspace @tool-boundary/cli && npm run typecheck --workspace tool-boundary-basic-http-tool",
+    "build": "npm run build --workspace @tool-boundary/core && npm run build --workspace @tool-boundary/config && npm run build --workspace tool-boundary-gateway && npm run build --workspace @tool-boundary/cli && npm run build --workspace tool-boundary-basic-http-tool && npm run build --workspace tool-boundary-basic-mcp-proxy",
+    "typecheck": "npm run typecheck --workspace @tool-boundary/core && npm run typecheck --workspace @tool-boundary/config && npm run typecheck --workspace tool-boundary-gateway && npm run typecheck --workspace @tool-boundary/cli && npm run typecheck --workspace tool-boundary-basic-http-tool && npm run typecheck --workspace tool-boundary-basic-mcp-proxy",
     "test": "vitest run",
     "example:basic": "npm run start --workspace tool-boundary-basic-http-tool"
   },

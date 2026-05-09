@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
 import Fastify from 'fastify';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -573,6 +574,113 @@ describe('gateway', () => {
     expect(await readFile(join(config.configDir, '.tool-boundary', 'audit.jsonl'), 'utf8')).toContain('tool_output_validation_failed');
   });
 
+  it('calls an MCP upstream read target through ToolCallService', async () => {
+    const base = await testConfig();
+    const fixture = await writeMcpFixtureServer(base.configDir);
+    const config = withMcpFixtureTools(base, fixture);
+    const app = createGatewayServer(config);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/tools/mcp.searchUsers/call',
+      headers: agentHeaders(),
+      payload: { input: { query: 'ada' } }
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ ok: true, output: { users: [{ id: 'usr_123', query: 'ada' }] } });
+  });
+
+  it('requires approval and idempotency for MCP upstream mutating targets', async () => {
+    const base = await testConfig();
+    const fixture = await writeMcpFixtureServer(base.configDir);
+    const config = withMcpFixtureTools(base, fixture);
+    const app = createGatewayServer(config);
+
+    const requested = await app.inject({
+      method: 'POST',
+      url: '/v1/tools/mcp.disableUser/call',
+      headers: agentHeaders(),
+      payload: { input: { userId: 'usr_123', reasonCode: 'policy-review' } }
+    });
+    expect(requested.statusCode).toBe(400);
+    expect(requested.json().error.code).toBe('APPROVAL_REQUIRED');
+    const approvalId = requested.json().error.details.approvalId as string;
+
+    const approved = await app.inject({
+      method: 'POST',
+      url: `/v1/approvals/${approvalId}/approve`,
+      headers: operatorHeaders(),
+      payload: {}
+    });
+    const approvalToken = approved.json().approvalToken as string;
+
+    const executed = await app.inject({
+      method: 'POST',
+      url: '/v1/tools/mcp.disableUser/call',
+      headers: agentHeaders(),
+      payload: {
+        approvalToken,
+        idempotencyKey: 'mcp-disable-user',
+        input: { userId: 'usr_123', reasonCode: 'policy-review' }
+      }
+    });
+    expect(executed.statusCode).toBe(200);
+    expect(executed.json()).toMatchObject({ ok: true, output: { disabled: true, userId: 'usr_123' } });
+
+    const replay = await app.inject({
+      method: 'POST',
+      url: '/v1/tools/mcp.disableUser/call',
+      headers: agentHeaders(),
+      payload: {
+        approvalToken,
+        idempotencyKey: 'mcp-disable-user',
+        input: { userId: 'usr_123', reasonCode: 'policy-review' }
+      }
+    });
+    expect(replay.statusCode).toBe(200);
+    expect(replay.json()).toMatchObject({ idempotencyReplay: true });
+  });
+
+  it('maps MCP upstream errors and timeouts to stable ToolBoundary errors', async () => {
+    const base = await testConfig();
+    const fixture = await writeMcpFixtureServer(base.configDir);
+    const config = withMcpFixtureTools(base, fixture);
+    const app = createGatewayServer(config);
+
+    const error = await app.inject({
+      method: 'POST',
+      url: '/v1/tools/mcp.error/call',
+      headers: agentHeaders(),
+      payload: { input: {} }
+    });
+    expect(error.statusCode).toBe(502);
+    expect(error.json().error.code).toBe('TOOL_UPSTREAM_ERROR');
+
+    const timeout = await app.inject({
+      method: 'POST',
+      url: '/v1/tools/mcp.slow/call',
+      headers: agentHeaders(),
+      payload: { input: {} }
+    });
+    expect(timeout.statusCode).toBe(504);
+    expect(timeout.json().error.code).toBe('TOOL_UPSTREAM_TIMEOUT');
+  });
+
+  it('applies output validation to MCP upstream results', async () => {
+    const base = await testConfig();
+    const fixture = await writeMcpFixtureServer(base.configDir);
+    const config = withMcpFixtureTools(base, fixture);
+    const app = createGatewayServer(config);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/tools/mcp.invalidOutput/call',
+      headers: agentHeaders(),
+      payload: { input: {} }
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.code).toBe('TOOL_OUTPUT_SCHEMA_VALIDATION_FAILED');
+    expect(await readFile(join(config.configDir, '.tool-boundary', 'audit.jsonl'), 'utf8')).toContain('tool_output_validation_failed');
+  });
+
   it('exposes configured tools through MCP and reuses ToolCallService', async () => {
     const config = await testConfig();
     const server = createMcpServer(config, { principal: { name: 'local-agent', scopes: ['tools:read', 'tools:call', 'approvals:request'] } });
@@ -596,6 +704,29 @@ describe('gateway', () => {
       expect(mutateCall.isError).toBe(true);
       expect(JSON.parse((mutateCall.content[0] as { readonly text: string }).text)).toMatchObject({ code: 'APPROVAL_REQUIRED' });
       expect(await readFile(join(config.configDir, '.tool-boundary', 'audit.jsonl'), 'utf8')).toContain('approval_requested');
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it('exposes MCP-backed tools through the ToolBoundary MCP server', async () => {
+    const base = await testConfig();
+    const fixture = await writeMcpFixtureServer(base.configDir);
+    const config = withMcpFixtureTools(base, fixture);
+    const server = createMcpServer(config, { principal: { name: 'local-agent', scopes: ['tools:read', 'tools:call', 'approvals:request'] } });
+    const client = new Client({ name: 'tool-boundary-test', version: '0.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    try {
+      const tools = await client.listTools();
+      expect(tools.tools.map((tool) => tool.name)).toContain('mcp.searchUsers');
+      const readCall = await client.callTool({
+        name: 'mcp.searchUsers',
+        arguments: { input: { query: 'ada' } }
+      });
+      expect(readCall.isError).toBeFalsy();
+      expect(readCall.structuredContent).toEqual({ users: [{ id: 'usr_123', query: 'ada' }] });
     } finally {
       await client.close();
       await server.close();
@@ -640,6 +771,123 @@ function withSearchTool(config: LoadedConfig, patch: Partial<ToolDefinition>): L
   };
 }
 
+function withMcpFixtureTools(config: LoadedConfig, fixturePath: string): LoadedConfig {
+  return {
+    ...config,
+    mcp: {
+      upstreams: {
+        localFixture: {
+          transport: 'stdio',
+          command: process.execPath,
+          args: [fixturePath],
+          cwd: config.configDir
+        }
+      }
+    },
+    tools: {
+      ...config.tools,
+      'mcp.searchUsers': {
+        name: 'mcp.searchUsers',
+        mode: 'read',
+        description: 'Search users through MCP',
+        inputSchema: { type: 'object', required: ['query'], properties: { query: { type: 'string' } } },
+        outputSchema: { type: 'object', required: ['users'], properties: { users: { type: 'array' } } },
+        outputValidation: { enabled: true, mode: 'enforce' },
+        target: { type: 'mcp', upstream: 'localFixture', toolName: 'searchUsers', timeoutMs: 1000 }
+      },
+      'mcp.disableUser': {
+        name: 'mcp.disableUser',
+        mode: 'mutate',
+        riskLevel: 'high',
+        approvalRequired: true,
+        description: 'Disable users through MCP',
+        inputSchema: {
+          type: 'object',
+          required: ['userId', 'reasonCode'],
+          properties: { userId: { type: 'string' }, reasonCode: { type: 'string' } }
+        },
+        outputSchema: { type: 'object', required: ['disabled', 'userId'], properties: { disabled: { type: 'boolean' }, userId: { type: 'string' } } },
+        outputValidation: { enabled: true, mode: 'enforce' },
+        target: { type: 'mcp', upstream: 'localFixture', toolName: 'disableUser', timeoutMs: 1000 },
+        policy: 'allowMutatingApproved',
+        approval: { previewPaths: ['/userId', '/reasonCode'] },
+        idempotency: { required: true },
+        audit: { input: 'redacted', output: 'summary', error: 'summary', redactPaths: ['/reasonCode'] }
+      },
+      'mcp.error': {
+        name: 'mcp.error',
+        mode: 'read',
+        description: 'MCP error fixture',
+        target: { type: 'mcp', upstream: 'localFixture', toolName: 'errorTool', timeoutMs: 1000 }
+      },
+      'mcp.slow': {
+        name: 'mcp.slow',
+        mode: 'read',
+        description: 'MCP slow fixture',
+        target: { type: 'mcp', upstream: 'localFixture', toolName: 'slowTool', timeoutMs: 50 }
+      },
+      'mcp.invalidOutput': {
+        name: 'mcp.invalidOutput',
+        mode: 'read',
+        description: 'MCP invalid output fixture',
+        outputSchema: { type: 'object', required: ['ok'], properties: { ok: { type: 'boolean' } } },
+        outputValidation: { enabled: true, mode: 'enforce' },
+        target: { type: 'mcp', upstream: 'localFixture', toolName: 'invalidOutput', timeoutMs: 1000 }
+      }
+    }
+  };
+}
+
+async function writeMcpFixtureServer(dir: string): Promise<string> {
+  const path = join(dir, 'mcp-fixture-server.mjs');
+  const sdkRoot = join(process.cwd(), 'node_modules', '@modelcontextprotocol', 'sdk', 'dist', 'esm');
+  const serverUrl = pathToFileURL(join(sdkRoot, 'server', 'index.js')).href;
+  const stdioUrl = pathToFileURL(join(sdkRoot, 'server', 'stdio.js')).href;
+  const typesUrl = pathToFileURL(join(sdkRoot, 'types.js')).href;
+  await writeFile(
+    path,
+    `
+import { setTimeout as delay } from 'node:timers/promises';
+import { Server } from '${serverUrl}';
+import { StdioServerTransport } from '${stdioUrl}';
+import { CallToolRequestSchema, ListToolsRequestSchema } from '${typesUrl}';
+
+const server = new Server({ name: 'fixture-mcp-upstream', version: '0.0.0' }, { capabilities: { tools: {} } });
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [
+    { name: 'searchUsers', inputSchema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } },
+    { name: 'disableUser', inputSchema: { type: 'object', properties: { userId: { type: 'string' }, reasonCode: { type: 'string' } }, required: ['userId', 'reasonCode'] } },
+    { name: 'errorTool', inputSchema: { type: 'object' } },
+    { name: 'slowTool', inputSchema: { type: 'object' } },
+    { name: 'invalidOutput', inputSchema: { type: 'object' } }
+  ]
+}));
+
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const args = request.params.arguments ?? {};
+  if (request.params.name === 'searchUsers') return json({ users: [{ id: 'usr_123', query: args.query }] });
+  if (request.params.name === 'disableUser') return json({ disabled: true, userId: args.userId });
+  if (request.params.name === 'errorTool') return { isError: true, content: [{ type: 'text', text: 'fixture failure' }] };
+  if (request.params.name === 'slowTool') {
+    await delay(150);
+    return json({ ok: true });
+  }
+  if (request.params.name === 'invalidOutput') return json({ wrong: true });
+  return { isError: true, content: [{ type: 'text', text: 'unknown tool' }] };
+});
+
+await server.connect(new StdioServerTransport());
+
+function json(value) {
+  return { content: [{ type: 'text', text: JSON.stringify(value) }], structuredContent: value };
+}
+`,
+    'utf8'
+  );
+  return path;
+}
+
 async function testConfig(): Promise<LoadedConfig> {
   const dir = await mkdtemp(join(tmpdir(), 'tool-boundary-gateway-'));
   return {
@@ -678,6 +926,7 @@ async function testConfig(): Promise<LoadedConfig> {
       }
     },
     storage: { type: 'file' },
+    mcp: { upstreams: {} },
     policies: {
       default: { allowedModes: ['read', 'draft', 'dryRun'] },
       allowMutatingApproved: {

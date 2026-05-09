@@ -61,6 +61,17 @@ describe('cli', () => {
       })
     ).toBe(1);
     expect(mcpOutput.join('')).toContain('Missing MCP token env MISSING_TOKEN');
+
+    const proxyOutput: string[] = [];
+    expect(
+      await runCli(['mcp:proxy', '--token-env', 'TOOL_BOUNDARY_AGENT_TOKEN'], {
+        cwd: dir,
+        env: { TOOL_BOUNDARY_AGENT_TOKEN: 'agent-token', TOOL_BOUNDARY_OPERATOR_TOKEN: 'operator-token' },
+        stdout: (text) => proxyOutput.push(text),
+        stderr: (text) => proxyOutput.push(text)
+      })
+    ).toBe(1);
+    expect(proxyOutput.join('')).toContain('mcp:proxy requires at least one configured MCP target');
   });
 
   it('lists tools, approvals, and audit lines', async () => {
