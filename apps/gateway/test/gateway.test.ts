@@ -2,10 +2,12 @@ import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import Fastify from 'fastify';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { LoadedConfig } from '@tool-boundary/config';
 import { FileApprovalStore, FileIdempotencyStore, JsonlAuditSink, hashUnknown, type ToolDefinition } from '@tool-boundary/core';
-import { createGatewayServer } from '../src/index.js';
+import { createGatewayServer, createMcpServer } from '../src/index.js';
 
 const agentToken = 'agent-token';
 const otherAgentToken = 'other-agent-token';
@@ -26,6 +28,7 @@ beforeEach(async () => {
   upstream.post('/tools/error', async (_request, reply) => {
     await reply.code(500).send({ error: 'fixture failure' });
   });
+  upstream.post('/tools/invalid-output', async () => ({ wrong: true }));
   await upstream.listen({ host: '127.0.0.1', port: 0 });
   const address = upstream.server.address();
   if (address === null || typeof address === 'string') throw new Error('Failed to bind upstream fixture');
@@ -357,7 +360,8 @@ describe('gateway', () => {
   });
 
   it('detects idempotency conflicts', async () => {
-    const app = createGatewayServer(await testConfig());
+    const config = await testConfig();
+    const app = createGatewayServer(config);
     const first = await app.inject({
       method: 'POST',
       url: '/v1/tools/admin.searchUsers/call',
@@ -374,6 +378,8 @@ describe('gateway', () => {
     });
     expect(second.statusCode).toBe(400);
     expect(second.json().error.code).toBe('IDEMPOTENCY_CONFLICT');
+    const audit = await readFile(join(config.configDir, '.tool-boundary', 'audit.jsonl'), 'utf8');
+    expect(audit).toContain('Idempotency conflict: input_mismatch');
   });
 
   it('scopes idempotency records by principal', async () => {
@@ -541,6 +547,61 @@ describe('gateway', () => {
     expect(second.json().error.code).toBe('IDEMPOTENCY_CONFLICT');
   });
 
+  it('enforces output validation when configured', async () => {
+    const app = createGatewayServer(await testConfig());
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/tools/fixture.invalidOutputEnforce/call',
+      headers: agentHeaders(),
+      payload: { input: {} }
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.code).toBe('TOOL_OUTPUT_SCHEMA_VALIDATION_FAILED');
+  });
+
+  it('audits output validation failures in auditOnly mode', async () => {
+    const config = await testConfig();
+    const app = createGatewayServer(config);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/tools/fixture.invalidOutputAuditOnly/call',
+      headers: agentHeaders(),
+      payload: { input: {} }
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ ok: true, output: { wrong: true } });
+    expect(await readFile(join(config.configDir, '.tool-boundary', 'audit.jsonl'), 'utf8')).toContain('tool_output_validation_failed');
+  });
+
+  it('exposes configured tools through MCP and reuses ToolCallService', async () => {
+    const config = await testConfig();
+    const server = createMcpServer(config, { principal: { name: 'local-agent', scopes: ['tools:read', 'tools:call', 'approvals:request'] } });
+    const client = new Client({ name: 'tool-boundary-test', version: '0.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    try {
+      const tools = await client.listTools();
+      expect(tools.tools.map((tool) => tool.name)).toContain('admin.searchUsers');
+      const readCall = await client.callTool({
+        name: 'admin.searchUsers',
+        arguments: { input: { query: 'ada' } }
+      });
+      expect(readCall.isError).toBeFalsy();
+      expect(readCall.content[0]).toMatchObject({ type: 'text' });
+
+      const mutateCall = await client.callTool({
+        name: 'admin.disableUser',
+        arguments: { input: { userId: 'usr_123', reason: 'mcp-approval-required' } }
+      });
+      expect(mutateCall.isError).toBe(true);
+      expect(JSON.parse((mutateCall.content[0] as { readonly text: string }).text)).toMatchObject({ code: 'APPROVAL_REQUIRED' });
+      expect(await readFile(join(config.configDir, '.tool-boundary', 'audit.jsonl'), 'utf8')).toContain('approval_requested');
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
   it('rejects missing runtime policy references instead of falling back silently', async () => {
     const config = await testConfig();
     const app = createGatewayServer({
@@ -616,6 +677,7 @@ async function testConfig(): Promise<LoadedConfig> {
         redactPaths: ['/secret', '/token', '/authorization']
       }
     },
+    storage: { type: 'file' },
     policies: {
       default: { allowedModes: ['read', 'draft', 'dryRun'] },
       allowMutatingApproved: {
@@ -669,6 +731,22 @@ async function testConfig(): Promise<LoadedConfig> {
         mode: 'read',
         description: 'Error tool',
         target: { type: 'http', method: 'POST', url: `${upstreamUrl}/tools/error` }
+      },
+      'fixture.invalidOutputEnforce': {
+        name: 'fixture.invalidOutputEnforce',
+        mode: 'read',
+        description: 'Invalid output enforce fixture',
+        target: { type: 'http', method: 'POST', url: `${upstreamUrl}/tools/invalid-output` },
+        outputSchema: { type: 'object', required: ['ok'], properties: { ok: { type: 'boolean' } } },
+        outputValidation: { enabled: true, mode: 'enforce' }
+      },
+      'fixture.invalidOutputAuditOnly': {
+        name: 'fixture.invalidOutputAuditOnly',
+        mode: 'read',
+        description: 'Invalid output audit-only fixture',
+        target: { type: 'http', method: 'POST', url: `${upstreamUrl}/tools/invalid-output` },
+        outputSchema: { type: 'object', required: ['ok'], properties: { ok: { type: 'boolean' } } },
+        outputValidation: { enabled: true, mode: 'auditOnly' }
       }
     },
     configPath: join(dir, 'tool-boundary.config.yaml'),

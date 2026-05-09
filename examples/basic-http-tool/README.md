@@ -2,6 +2,14 @@
 
 This example runs a local upstream HTTP tool server for ToolBoundary.
 
+Docker:
+
+```bash
+docker compose -f examples/basic-http-tool/compose.yaml up --build
+```
+
+Manual:
+
 ```bash
 npm install
 $env:TOOL_BOUNDARY_AGENT_TOKEN="agent-token"
@@ -27,3 +35,5 @@ curl -X POST http://127.0.0.1:3050/v1/tools/admin.searchUsers/call `
 ```
 
 Mutating calls require approval and an idempotency key. Idempotency replay is scoped to the caller and the tool execution fingerprint; bump `version` in the tool config when upstream behavior changes intentionally.
+
+The example config uses SQLite storage so approvals, idempotency records, and audit events survive gateway restarts in `.tool-boundary/toolboundary.db`.

@@ -33,6 +33,10 @@ audit:
       - /secret
       - /authorization
 
+storage:
+  type: sqlite
+  path: .tool-boundary/toolboundary.db
+
 policies:
   default:
     allowedModes: [read, draft, dryRun]
@@ -51,6 +55,9 @@ tools:
       type: object
     outputSchema:
       type: object
+    outputValidation:
+      enabled: true
+      mode: enforce
     target:
       type: http
       method: POST
@@ -74,6 +81,9 @@ tools:
           type: string
     outputSchema:
       type: object
+    outputValidation:
+      enabled: true
+      mode: enforce
     target:
       type: http
       method: POST

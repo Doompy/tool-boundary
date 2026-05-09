@@ -36,4 +36,4 @@ app.post('/tools/error', async (_request, reply) => {
 });
 
 const port = Number(process.env.UPSTREAM_PORT ?? '4001');
-await app.listen({ host: '127.0.0.1', port });
+await app.listen({ host: process.env.UPSTREAM_HOST ?? '127.0.0.1', port });

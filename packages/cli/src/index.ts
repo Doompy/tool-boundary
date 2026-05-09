@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 import { constants } from 'node:fs';
-import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { access, mkdir, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { FileApprovalStore, ToolBoundaryError, toToolBoundaryError } from '@tool-boundary/core';
+import { ToolBoundaryError, toToolBoundaryError } from '@tool-boundary/core';
 import { doctorConfig, loadConfig, loadConfigUnresolved } from '@tool-boundary/config';
-import { startGateway } from 'tool-boundary-gateway';
+import { createRuntimeStores, resolveMcpPrincipal, startGateway, startMcpServer } from 'tool-boundary-gateway';
 
 export type CliIo = {
   readonly cwd: string;
@@ -29,6 +29,8 @@ export async function runCli(argv: readonly string[], io: Partial<CliIo> = {}): 
         return await initCommand(argv.slice(1), fullIo);
       case 'serve':
         return await serveCommand(argv.slice(1), fullIo);
+      case 'mcp:serve':
+        return await mcpServeCommand(argv.slice(1), fullIo);
       case 'doctor':
         return await doctorCommand(argv.slice(1), fullIo);
       case 'tools:list':
@@ -72,18 +74,37 @@ async function serveCommand(argv: readonly string[], io: CliIo): Promise<number>
   return 0;
 }
 
+async function mcpServeCommand(argv: readonly string[], io: CliIo): Promise<number> {
+  const tokenEnv = getOption(argv, '--token-env');
+  if (tokenEnv === undefined) throw new ToolBoundaryError('CONFIG_INVALID', 'mcp:serve requires --token-env');
+  const config = await loadConfig(resolveConfigPath(argv, io.cwd), { env: io.env });
+  const principal = resolveMcpPrincipal(config, tokenEnv, io.env);
+  await startMcpServer(config, { principal });
+  return 0;
+}
+
 async function doctorCommand(argv: readonly string[], io: CliIo): Promise<number> {
   const config = await loadConfigUnresolved(resolveConfigPath(argv, io.cwd));
   const diagnostics = doctorConfig(config, io.env);
-  if (diagnostics.length === 0) {
-    io.stdout('OK: no issues found\n');
-    return 0;
+  const format = getOption(argv, '--format') ?? 'text';
+  const ci = argv.includes('--ci');
+  if (format === 'json') {
+    io.stdout(`${JSON.stringify({ diagnostics }, null, 2)}\n`);
+  } else if (format === 'sarif') {
+    io.stdout(`${JSON.stringify(toSarif(diagnostics), null, 2)}\n`);
+  } else if (format !== 'text') {
+    throw new ToolBoundaryError('CONFIG_INVALID', `Unsupported doctor format ${format}`);
+  } else {
+    if (diagnostics.length === 0) {
+      io.stdout('OK: no issues found\n');
+    } else {
+      for (const diagnostic of diagnostics) {
+        const tool = diagnostic.toolName === undefined ? '' : ` ${diagnostic.toolName}`;
+        io.stdout(`${diagnostic.severity.toUpperCase()} ${diagnostic.code}${tool}: ${diagnostic.message}\n`);
+      }
+    }
   }
-  for (const diagnostic of diagnostics) {
-    const tool = diagnostic.toolName === undefined ? '' : ` ${diagnostic.toolName}`;
-    io.stdout(`${diagnostic.severity.toUpperCase()} ${diagnostic.code}${tool}: ${diagnostic.message}\n`);
-  }
-  return diagnostics.some((diagnostic) => diagnostic.severity === 'error') ? 1 : 0;
+  return diagnostics.some((diagnostic) => diagnostic.severity === 'error') || (ci && diagnostics.length > 0) ? 1 : 0;
 }
 
 async function toolsListCommand(argv: readonly string[], io: CliIo): Promise<number> {
@@ -96,8 +117,7 @@ async function toolsListCommand(argv: readonly string[], io: CliIo): Promise<num
 
 async function approvalsListCommand(argv: readonly string[], io: CliIo): Promise<number> {
   const config = await loadConfigUnresolved(resolveConfigPath(argv, io.cwd));
-  const store = new FileApprovalStore(resolve(config.configDir, '.tool-boundary', 'approvals.json'));
-  const approvals = await store.list();
+  const approvals = await createRuntimeStores(config).approvalStore.list();
   for (const approval of approvals) {
     io.stdout(`${approval.id}\t${approval.status}\t${approval.toolName}\t${approval.requestedBy}\n`);
   }
@@ -106,14 +126,10 @@ async function approvalsListCommand(argv: readonly string[], io: CliIo): Promise
 
 async function auditTailCommand(argv: readonly string[], io: CliIo): Promise<number> {
   const config = await loadConfigUnresolved(resolveConfigPath(argv, io.cwd));
-  const auditPath = resolveOptionPath(config.configDir, config.audit.path);
   const lines = Number(getOption(argv, '--lines') ?? '20');
-  const content = await readFile(auditPath, 'utf8').catch((error: unknown) => {
-    if (isMissingFile(error)) return '';
-    throw error;
-  });
-  for (const line of content.split(/\r?\n/).filter(Boolean).slice(-lines)) {
-    io.stdout(`${line}\n`);
+  const events = await createRuntimeStores(config).auditSink.query({ limit: 100_000 });
+  for (const event of events.events.slice(-lines)) {
+    io.stdout(`${JSON.stringify(event)}\n`);
   }
   return 0;
 }
@@ -142,21 +158,53 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
-function isMissingFile(error: unknown): boolean {
-  return typeof error === 'object' && error !== null && (error as { readonly code?: unknown }).code === 'ENOENT';
-}
-
 function helpText(): string {
   return `Usage: tool-boundary <command> [options]
 
 Commands:
   init [--config path]
   serve --config path
-  doctor --config path
+  mcp:serve --config path --token-env env
+  doctor --config path [--format text|json|sarif] [--ci]
   tools:list --config path
   approvals:list --config path
   audit:tail --config path [--lines n]
 `;
+}
+
+function toSarif(diagnostics: readonly { readonly severity: 'error' | 'warning'; readonly code: string; readonly message: string; readonly toolName?: string }[]): object {
+  const rules = new Map(diagnostics.map((diagnostic) => [diagnostic.code, diagnostic]));
+  return {
+    version: '2.1.0',
+    $schema: 'https://json.schemastore.org/sarif-2.1.0.json',
+    runs: [
+      {
+        tool: {
+          driver: {
+            name: 'tool-boundary doctor',
+            rules: [...rules.values()].map((diagnostic) => ({
+              id: diagnostic.code,
+              shortDescription: { text: diagnostic.code },
+              fullDescription: { text: diagnostic.message }
+            }))
+          }
+        },
+        results: diagnostics.map((diagnostic) => ({
+          ruleId: diagnostic.code,
+          level: diagnostic.severity === 'error' ? 'error' : 'warning',
+          message: { text: diagnostic.message },
+          locations:
+            diagnostic.toolName === undefined
+              ? []
+              : [
+                  {
+                    logicalLocations: [{ name: diagnostic.toolName, kind: 'function' }]
+                  }
+                ]
+        }))
+      }
+    ]
+  };
 }
 
 function defaultConfigYaml(): string {
@@ -195,6 +243,9 @@ audit:
       - /secret
       - /authorization
 
+storage:
+  type: file
+
 policies:
   default:
     allowedModes: [read, draft, dryRun]
@@ -213,6 +264,9 @@ tools:
       type: object
     outputSchema:
       type: object
+    outputValidation:
+      enabled: true
+      mode: enforce
     target:
       type: http
       method: POST
@@ -236,6 +290,9 @@ tools:
           type: string
     outputSchema:
       type: object
+    outputValidation:
+      enabled: true
+      mode: enforce
     target:
       type: http
       method: POST

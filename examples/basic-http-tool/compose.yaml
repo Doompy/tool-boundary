@@ -1,0 +1,28 @@
+services:
+  upstream:
+    build:
+      context: ../..
+    environment:
+      UPSTREAM_HOST: 0.0.0.0
+    command: ["node", "examples/basic-http-tool/dist/upstream-server.js"]
+    ports:
+      - "4001:4001"
+
+  gateway:
+    build:
+      context: ../..
+    depends_on:
+      - upstream
+    environment:
+      TOOL_BOUNDARY_AGENT_TOKEN: agent-token
+      TOOL_BOUNDARY_OPERATOR_TOKEN: operator-token
+    command:
+      - /bin/sh
+      - -lc
+      - >
+        cp examples/basic-http-tool/tool-boundary.config.yaml /tmp/tool-boundary.config.yaml &&
+        sed -i 's|host: 127.0.0.1|host: 0.0.0.0|g' /tmp/tool-boundary.config.yaml &&
+        sed -i 's|http://localhost:4001|http://upstream:4001|g' /tmp/tool-boundary.config.yaml &&
+        node packages/cli/dist/index.js serve --config /tmp/tool-boundary.config.yaml
+    ports:
+      - "3050:3050"

@@ -3,6 +3,7 @@ export type ErrorCode =
   | 'FORBIDDEN'
   | 'TOOL_NOT_FOUND'
   | 'TOOL_SCHEMA_VALIDATION_FAILED'
+  | 'TOOL_OUTPUT_SCHEMA_VALIDATION_FAILED'
   | 'POLICY_DENIED'
   | 'APPROVAL_REQUIRED'
   | 'APPROVAL_INVALID'
@@ -44,6 +45,7 @@ export function defaultStatusCode(code: ErrorCode): number {
     case 'TOOL_NOT_FOUND':
       return 404;
     case 'TOOL_SCHEMA_VALIDATION_FAILED':
+    case 'TOOL_OUTPUT_SCHEMA_VALIDATION_FAILED':
     case 'APPROVAL_REQUIRED':
     case 'APPROVAL_INVALID':
     case 'APPROVAL_EXPIRED':

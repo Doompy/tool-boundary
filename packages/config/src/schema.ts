@@ -17,6 +17,11 @@ export const idempotencyPolicySchema = z.object({
   required: z.boolean().optional()
 });
 
+export const outputValidationPolicySchema = z.object({
+  enabled: z.boolean().optional(),
+  mode: z.enum(['enforce', 'auditOnly']).default('enforce')
+});
+
 export const toolApprovalPolicySchema = z.object({
   previewPaths: z.array(jsonPointerSchema).optional()
 });
@@ -42,6 +47,16 @@ const mockTargetSchema = z.object({
   result: z.unknown()
 });
 
+const storageSchema = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('file')
+  }),
+  z.object({
+    type: z.literal('sqlite'),
+    path: z.string().default('.tool-boundary/toolboundary.db')
+  })
+]);
+
 export const rawToolDefinitionSchema = z.object({
   version: z.string().optional(),
   description: z.string().optional(),
@@ -50,6 +65,7 @@ export const rawToolDefinitionSchema = z.object({
   approvalRequired: z.boolean().optional(),
   inputSchema: z.unknown().optional(),
   outputSchema: z.unknown().optional(),
+  outputValidation: outputValidationPolicySchema.optional(),
   target: z.discriminatedUnion('type', [httpTargetSchema, mockTargetSchema]),
   policy: z.string().optional(),
   approval: toolApprovalPolicySchema.optional(),
@@ -84,6 +100,7 @@ export const rawConfigSchema = z.object({
       defaults: auditPayloadPolicySchema.default({})
     })
     .default({ sink: 'jsonl', path: '.tool-boundary/audit.jsonl', defaults: {} }),
+  storage: storageSchema.default({ type: 'file' }),
   policies: z.record(z.string(), toolPolicySchema).default({}),
   tools: z.record(z.string(), rawToolDefinitionSchema)
 });

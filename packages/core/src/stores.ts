@@ -30,7 +30,6 @@ type IdempotencyFile = {
 
 export interface AuditSink {
   write(event: AuditEvent): Promise<void>;
-  readAll(): Promise<readonly AuditEvent[]>;
   query(filter: AuditQuery): Promise<AuditQueryResult>;
 }
 
@@ -48,7 +47,9 @@ export interface ApprovalStore {
 export type IdempotencyCheckResult =
   | { readonly status: 'miss' }
   | { readonly status: 'replay'; readonly result: StoredToolCallResult }
-  | { readonly status: 'conflict' };
+  | { readonly status: 'conflict'; readonly reason: IdempotencyConflictReason };
+
+export type IdempotencyConflictReason = 'input_mismatch' | 'execution_fingerprint_mismatch' | 'legacy_record';
 
 export interface IdempotencyStore {
   check(toolName: string, key: string, inputHash: string, principalName: string, executionFingerprint: string): Promise<IdempotencyCheckResult>;
@@ -292,8 +293,9 @@ export class FileIdempotencyStore implements IdempotencyStore {
       (candidate) => candidate.toolName === toolName && candidate.key === key && candidate.principalName === principalName
     );
     if (record === undefined) return { status: 'miss' };
-    if (record.inputHash !== inputHash) return { status: 'conflict' };
-    if (record.executionFingerprint !== executionFingerprint) return { status: 'conflict' };
+    if (record.inputHash !== inputHash) return { status: 'conflict', reason: 'input_mismatch' };
+    if (record.executionFingerprint === undefined) return { status: 'conflict', reason: 'legacy_record' };
+    if (record.executionFingerprint !== executionFingerprint) return { status: 'conflict', reason: 'execution_fingerprint_mismatch' };
     return { status: 'replay', result: record.result };
   }
 

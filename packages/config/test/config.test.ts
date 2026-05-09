@@ -46,6 +46,7 @@ describe('config loader', () => {
     const config = await loadConfig(path, { env: { TOOL_BOUNDARY_AGENT_TOKEN: 'token' } });
     expect(config.auth.tokens[0]?.token).toBe('token');
     expect(config.tools['admin.searchUsers']?.name).toBe('admin.searchUsers');
+    expect(config.storage.type).toBe('file');
   });
 
   it('loads tool versions', async () => {
@@ -54,6 +55,27 @@ describe('config loader', () => {
     await writeFile(path, validConfig.replace('mode: read', 'version: "2026-05-10.1"\n    mode: read'));
     const config = await loadConfig(path, { env: { TOOL_BOUNDARY_AGENT_TOKEN: 'token' } });
     expect(config.tools['admin.searchUsers']?.version).toBe('2026-05-10.1');
+  });
+
+  it('loads sqlite storage and output validation config', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tool-boundary-config-'));
+    const path = join(dir, 'tool-boundary.config.yaml');
+    await writeFile(
+      path,
+      validConfig
+        .replace(
+          'policies:',
+          'storage:\n  type: sqlite\n  path: .tool-boundary/toolboundary.db\npolicies:'
+        )
+        .replace('outputSchema:\n      type: object', 'outputSchema:\n      type: object\n    outputValidation:\n      enabled: true\n      mode: auditOnly')
+    );
+    const config = await loadConfig(path, { env: { TOOL_BOUNDARY_AGENT_TOKEN: 'token' } });
+    expect(config.storage).toEqual({ type: 'sqlite', path: '.tool-boundary/toolboundary.db' });
+    expect(config.tools['admin.searchUsers']?.outputValidation).toEqual({ enabled: true, mode: 'auditOnly' });
+  });
+
+  it('rejects invalid storage config', () => {
+    expect(() => parseConfigContent(validConfig.replace('policies:', 'storage:\n  type: postgres\npolicies:'))).toThrow();
   });
 
   it('rejects missing token env in strict load', async () => {
@@ -96,6 +118,21 @@ describe('config loader', () => {
     const config = await loadConfigUnresolved(path);
     const diagnostics = doctorConfig(config, { TOOL_BOUNDARY_AGENT_TOKEN: 'token' });
     expect(diagnostics.map((diagnostic) => diagnostic.code)).toContain('HIGH_RISK_WITHOUT_APPROVAL_PREVIEW');
+    expect(diagnostics.map((diagnostic) => diagnostic.code)).toContain('HIGH_RISK_WITHOUT_OUTPUT_VALIDATION');
+  });
+
+  it('reports output validation without output schema', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tool-boundary-config-'));
+    const path = join(dir, 'tool-boundary.config.yaml');
+    await writeFile(
+      path,
+      validConfig
+        .replace('    outputSchema:\n      type: object\n', '')
+        .replace('target:', 'outputValidation:\n      enabled: true\n      mode: enforce\n    target:')
+    );
+    const config = await loadConfigUnresolved(path);
+    const diagnostics = doctorConfig(config, { TOOL_BOUNDARY_AGENT_TOKEN: 'token' });
+    expect(diagnostics.map((diagnostic) => diagnostic.code)).toContain('OUTPUT_VALIDATION_WITHOUT_SCHEMA');
   });
 
   it('uses runtime policy rules when checking mutate approval and idempotency', async () => {

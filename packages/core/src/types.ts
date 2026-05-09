@@ -30,6 +30,11 @@ export type IdempotencyPolicy = {
   readonly required?: boolean;
 };
 
+export type OutputValidationPolicy = {
+  readonly enabled?: boolean;
+  readonly mode?: 'enforce' | 'auditOnly';
+};
+
 export type ToolPolicyRef = string;
 
 export type ToolApprovalPolicy = {
@@ -45,6 +50,7 @@ export type ToolDefinition = {
   readonly approvalRequired?: boolean;
   readonly inputSchema?: unknown;
   readonly outputSchema?: unknown;
+  readonly outputValidation?: OutputValidationPolicy;
   readonly target: ToolTarget;
   readonly policy?: ToolPolicyRef;
   readonly approval?: ToolApprovalPolicy;
@@ -126,7 +132,8 @@ export type AuditEventType =
   | 'approval_approved'
   | 'approval_rejected'
   | 'approval_consumed'
-  | 'approval_expired';
+  | 'approval_expired'
+  | 'tool_output_validation_failed';
 
 export type AuditEvent = {
   readonly id: string;

@@ -1,6 +1,14 @@
 # MCP Proxy Roadmap
 
-ToolBoundary MVP starts with HTTP tools because HTTP calls are easy to run locally, test deterministically, and audit without introducing MCP transport complexity.
+ToolBoundary v0.2 exposes configured ToolBoundary tools as an MCP stdio server. That mode reuses the same policy, approval, audit, redaction, output validation, and idempotency path as the HTTP gateway.
+
+Upstream MCP proxying remains a later transport because wrapping third-party MCP servers adds authorization, process management, and origin-validation complexity.
+
+## Current Transport Shape
+
+- `tool-boundary mcp:serve --config <path> --token-env <env>` starts an MCP stdio server.
+- Each configured ToolBoundary tool is listed as an MCP tool.
+- Tool calls pass through ToolBoundary's existing service layer instead of bypassing the action boundary.
 
 ## Future Transport Shape
 

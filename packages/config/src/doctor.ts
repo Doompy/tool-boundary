@@ -157,6 +157,24 @@ function doctorTool(tool: ToolDefinition, config: UnresolvedLoadedConfig): reado
     });
   }
 
+  if (tool.outputValidation?.enabled === true && tool.outputSchema === undefined) {
+    diagnostics.push({
+      severity: 'error',
+      code: 'OUTPUT_VALIDATION_WITHOUT_SCHEMA',
+      message: 'Output validation is enabled but outputSchema is missing',
+      toolName: tool.name
+    });
+  }
+
+  if (isHighRisk(tool) && tool.outputValidation?.enabled !== true) {
+    diagnostics.push({
+      severity: 'warning',
+      code: 'HIGH_RISK_WITHOUT_OUTPUT_VALIDATION',
+      message: 'High or critical risk tool should enable output validation',
+      toolName: tool.name
+    });
+  }
+
   if (isHighRisk(tool) && tool.audit?.output === 'full') {
     diagnostics.push({
       severity: 'error',

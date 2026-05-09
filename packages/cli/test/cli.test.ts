@@ -27,6 +27,40 @@ describe('cli', () => {
     });
     expect(doctorCode).toBe(1);
     expect(doctorOutput.join('')).toContain('STATIC_TOKEN_ENV_MISSING');
+
+    const jsonOutput: string[] = [];
+    expect(await runCli(['doctor', '--format', 'json'], { cwd: dir, env: {}, stdout: (text) => jsonOutput.push(text), stderr: () => undefined })).toBe(1);
+    expect(JSON.parse(jsonOutput.join('')).diagnostics[0].code).toBe('STATIC_TOKEN_ENV_MISSING');
+
+    const sarifOutput: string[] = [];
+    expect(await runCli(['doctor', '--format', 'sarif'], { cwd: dir, env: {}, stdout: (text) => sarifOutput.push(text), stderr: () => undefined })).toBe(1);
+    expect(JSON.parse(sarifOutput.join('')).runs[0].tool.driver.name).toBe('tool-boundary doctor');
+  });
+
+  it('supports doctor --ci and rejects invalid MCP token env before starting', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tool-boundary-cli-'));
+    await runCli(['init'], { cwd: dir, stdout: () => undefined, stderr: () => undefined });
+
+    const ciOutput: string[] = [];
+    expect(
+      await runCli(['doctor', '--ci'], {
+        cwd: dir,
+        env: { TOOL_BOUNDARY_AGENT_TOKEN: 'agent-token', TOOL_BOUNDARY_OPERATOR_TOKEN: 'operator-token' },
+        stdout: (text) => ciOutput.push(text),
+        stderr: (text) => ciOutput.push(text)
+      })
+    ).toBe(0);
+
+    const mcpOutput: string[] = [];
+    expect(
+      await runCli(['mcp:serve', '--token-env', 'MISSING_TOKEN'], {
+        cwd: dir,
+        env: { TOOL_BOUNDARY_AGENT_TOKEN: 'agent-token', TOOL_BOUNDARY_OPERATOR_TOKEN: 'operator-token' },
+        stdout: (text) => mcpOutput.push(text),
+        stderr: (text) => mcpOutput.push(text)
+      })
+    ).toBe(1);
+    expect(mcpOutput.join('')).toContain('Missing MCP token env MISSING_TOKEN');
   });
 
   it('lists tools, approvals, and audit lines', async () => {
