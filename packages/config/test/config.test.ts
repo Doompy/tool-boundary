@@ -48,6 +48,14 @@ describe('config loader', () => {
     expect(config.tools['admin.searchUsers']?.name).toBe('admin.searchUsers');
   });
 
+  it('loads tool versions', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tool-boundary-config-'));
+    const path = join(dir, 'tool-boundary.config.yaml');
+    await writeFile(path, validConfig.replace('mode: read', 'version: "2026-05-10.1"\n    mode: read'));
+    const config = await loadConfig(path, { env: { TOOL_BOUNDARY_AGENT_TOKEN: 'token' } });
+    expect(config.tools['admin.searchUsers']?.version).toBe('2026-05-10.1');
+  });
+
   it('rejects missing token env in strict load', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'tool-boundary-config-'));
     const path = join(dir, 'tool-boundary.config.yaml');
@@ -124,6 +132,26 @@ describe('config loader', () => {
     const config = await loadConfigUnresolved(path);
     const diagnostics = doctorConfig(config, { TOOL_BOUNDARY_AGENT_TOKEN: 'token' });
     expect(diagnostics.map((diagnostic) => diagnostic.code)).toContain('TOKEN_CAN_REQUEST_AND_APPROVE');
+  });
+
+  it('reports static token scope and duplicate diagnostics', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'tool-boundary-config-'));
+    const path = join(dir, 'tool-boundary.config.yaml');
+    await writeFile(
+      path,
+      validConfig.replace(
+        'scopes: [tools:read, tools:call]',
+        'scopes: [tools:read, approval:approve]\n    - name: local-agent\n      tokenEnv: TOOL_BOUNDARY_OTHER_TOKEN\n      scopes: [tools:read]\n    - name: local-operator\n      tokenEnv: TOOL_BOUNDARY_AGENT_TOKEN\n      scopes: [audit:read]'
+      )
+    );
+    const config = await loadConfigUnresolved(path);
+    const diagnostics = doctorConfig(config, {
+      TOOL_BOUNDARY_AGENT_TOKEN: 'same-token',
+      TOOL_BOUNDARY_OTHER_TOKEN: 'same-token'
+    });
+    expect(diagnostics.map((diagnostic) => diagnostic.code)).toEqual(
+      expect.arrayContaining(['UNKNOWN_SCOPE', 'DUPLICATE_TOKEN_NAME', 'DUPLICATE_TOKEN_ENV', 'DUPLICATE_RESOLVED_TOKEN'])
+    );
   });
 
   it('rejects non-POST HTTP targets in MVP config', () => {

@@ -26,4 +26,4 @@ curl -X POST http://127.0.0.1:3050/v1/tools/admin.searchUsers/call `
   -d "{\"input\":{\"query\":\"ada\"}}"
 ```
 
-Mutating calls require approval and an idempotency key.
+Mutating calls require approval and an idempotency key. Idempotency replay is scoped to the caller and the tool execution fingerprint; bump `version` in the tool config when upstream behavior changes intentionally.

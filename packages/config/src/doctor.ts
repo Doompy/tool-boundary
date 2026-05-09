@@ -7,6 +7,8 @@ import {
 } from '@tool-boundary/core';
 import type { UnresolvedLoadedConfig } from './load-config.js';
 
+const knownScopes = new Set(['tools:read', 'tools:call', 'approvals:read', 'approvals:request', 'approvals:approve', 'approvals:reject', 'audit:read']);
+
 export type DoctorDiagnostic = {
   readonly severity: 'error' | 'warning';
   readonly code: string;
@@ -17,14 +19,54 @@ export type DoctorDiagnostic = {
 export function doctorConfig(config: UnresolvedLoadedConfig, env: NodeJS.ProcessEnv = process.env): readonly DoctorDiagnostic[] {
   const diagnostics: DoctorDiagnostic[] = [];
 
+  diagnostics.push(...doctorStaticTokens(config, env));
+
+  for (const tool of Object.values(config.tools)) {
+    diagnostics.push(...doctorTool(tool, config));
+  }
+
+  return diagnostics;
+}
+
+function doctorStaticTokens(config: UnresolvedLoadedConfig, env: NodeJS.ProcessEnv): readonly DoctorDiagnostic[] {
+  const diagnostics: DoctorDiagnostic[] = [];
+  const names = new Map<string, number>();
+  const tokenEnvs = new Map<string, number>();
+  const resolvedValues = new Map<string, string>();
+
   for (const token of config.auth.tokens) {
+    names.set(token.name, (names.get(token.name) ?? 0) + 1);
+    tokenEnvs.set(token.tokenEnv, (tokenEnvs.get(token.tokenEnv) ?? 0) + 1);
+
     if (env[token.tokenEnv] === undefined || env[token.tokenEnv]?.length === 0) {
       diagnostics.push({
         severity: 'error',
         code: 'STATIC_TOKEN_ENV_MISSING',
         message: `Static token env ${token.tokenEnv} is not set`
       });
+    } else {
+      const value = env[token.tokenEnv] ?? '';
+      const existing = resolvedValues.get(value);
+      if (existing !== undefined && existing !== token.name) {
+        diagnostics.push({
+          severity: 'error',
+          code: 'DUPLICATE_RESOLVED_TOKEN',
+          message: `Static token ${token.name} resolves to the same value as ${existing}`
+        });
+      }
+      resolvedValues.set(value, token.name);
     }
+
+    for (const scope of token.scopes) {
+      if (!knownScopes.has(scope)) {
+        diagnostics.push({
+          severity: 'error',
+          code: 'UNKNOWN_SCOPE',
+          message: `Static token ${token.name} uses unknown scope ${scope}`
+        });
+      }
+    }
+
     if (token.scopes.includes('approvals:request') && (token.scopes.includes('approvals:approve') || token.scopes.includes('approvals:reject'))) {
       diagnostics.push({
         severity: 'warning',
@@ -34,8 +76,24 @@ export function doctorConfig(config: UnresolvedLoadedConfig, env: NodeJS.Process
     }
   }
 
-  for (const tool of Object.values(config.tools)) {
-    diagnostics.push(...doctorTool(tool, config));
+  for (const [name, count] of names) {
+    if (count > 1) {
+      diagnostics.push({
+        severity: 'error',
+        code: 'DUPLICATE_TOKEN_NAME',
+        message: `Static token name ${name} is defined more than once`
+      });
+    }
+  }
+
+  for (const [tokenEnv, count] of tokenEnvs) {
+    if (count > 1) {
+      diagnostics.push({
+        severity: 'warning',
+        code: 'DUPLICATE_TOKEN_ENV',
+        message: `Static token env ${tokenEnv} is referenced more than once`
+      });
+    }
   }
 
   return diagnostics;
@@ -94,7 +152,7 @@ function doctorTool(tool: ToolDefinition, config: UnresolvedLoadedConfig): reado
     diagnostics.push({
       severity: 'warning',
       code: 'TOOL_WITHOUT_OUTPUT_SCHEMA',
-      message: 'Tool should include an output schema placeholder',
+      message: 'Tool should include an output schema placeholder; runtime output validation is not enforced yet',
       toolName: tool.name
     });
   }

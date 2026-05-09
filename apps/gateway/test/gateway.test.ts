@@ -1,10 +1,10 @@
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import Fastify from 'fastify';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { LoadedConfig } from '@tool-boundary/config';
-import { FileApprovalStore, FileIdempotencyStore, JsonlAuditSink } from '@tool-boundary/core';
+import { FileApprovalStore, FileIdempotencyStore, JsonlAuditSink, hashUnknown, type ToolDefinition } from '@tool-boundary/core';
 import { createGatewayServer } from '../src/index.js';
 
 const agentToken = 'agent-token';
@@ -236,6 +236,16 @@ describe('gateway', () => {
     expect(agentAudit.statusCode).toBe(403);
     const operatorAudit = await app.inject({ method: 'GET', url: '/v1/audit', headers: operatorHeaders() });
     expect(operatorAudit.statusCode).toBe(200);
+
+    const filteredAudit = await app.inject({
+      method: 'GET',
+      url: '/v1/audit?limit=1&toolName=admin.disableUser&eventType=approval_requested',
+      headers: operatorHeaders()
+    });
+    expect(filteredAudit.statusCode).toBe(200);
+    expect(filteredAudit.json().events).toHaveLength(1);
+    expect(filteredAudit.json().events[0]).toMatchObject({ toolName: 'admin.disableUser', eventType: 'approval_requested' });
+    expect(filteredAudit.json().nextCursor === undefined || typeof filteredAudit.json().nextCursor === 'string').toBe(true);
   });
 
   it('expires approvals during list and audits the lifecycle event', async () => {
@@ -288,6 +298,40 @@ describe('gateway', () => {
       details: { approvalId }
     });
     expect(JSON.stringify(approved.json())).not.toContain('approvalTokenHash');
+    expect(await readFile(join(config.configDir, '.tool-boundary', 'audit.jsonl'), 'utf8')).toContain('approval_expired');
+  });
+
+  it('returns approval expiry before self-approval denial for expired approvals', async () => {
+    const config = await testConfig();
+    const app = createGatewayServer({
+      ...config,
+      auth: {
+        ...config.auth,
+        tokens: config.auth.tokens.map((token) =>
+          token.name === 'local-agent' ? { ...token, scopes: [...token.scopes, 'approvals:approve'] } : token
+        )
+      }
+    });
+    const created = await app.inject({
+      method: 'POST',
+      url: '/v1/approvals',
+      headers: agentHeaders(),
+      payload: {
+        toolName: 'admin.disableUser',
+        input: { userId: 'usr_123', reason: 'expired-self-approve-test' },
+        expiresAt: '2000-01-01T00:00:00.000Z'
+      }
+    });
+    const approvalId = created.json().id as string;
+    const approved = await app.inject({
+      method: 'POST',
+      url: `/v1/approvals/${approvalId}/approve`,
+      headers: agentHeaders(),
+      payload: {}
+    });
+    expect(approved.statusCode).toBe(400);
+    expect(approved.json().error).toMatchObject({ code: 'APPROVAL_EXPIRED', details: { approvalId } });
+    expect(approved.json().error.code).not.toBe('FORBIDDEN');
     expect(await readFile(join(config.configDir, '.tool-boundary', 'audit.jsonl'), 'utf8')).toContain('approval_expired');
   });
 
@@ -377,6 +421,106 @@ describe('gateway', () => {
     expect(second.json().error.code).toBe('IDEMPOTENCY_CONFLICT');
   });
 
+  it('does not replay idempotency records after execution fingerprint changes', async () => {
+    const cases: readonly {
+      readonly name: string;
+      readonly change: (config: LoadedConfig) => LoadedConfig;
+    }[] = [
+      {
+        name: 'target-url',
+        change: (config) =>
+          withSearchTool(config, {
+            target: { type: 'http', method: 'POST', url: `${upstreamUrl}/tools/admin.searchUsers-v2` }
+          })
+      },
+      {
+        name: 'target-headers',
+        change: (config) =>
+          withSearchTool(config, {
+            target: { type: 'http', method: 'POST', url: `${upstreamUrl}/tools/admin.searchUsers`, headers: { 'x-tool-version': '2' } }
+          })
+      },
+      {
+        name: 'timeout',
+        change: (config) =>
+          withSearchTool(config, {
+            target: { type: 'http', method: 'POST', url: `${upstreamUrl}/tools/admin.searchUsers`, timeoutMs: 2000 }
+          })
+      },
+      {
+        name: 'input-schema',
+        change: (config) =>
+          withSearchTool(config, {
+            inputSchema: { type: 'object', required: ['query'], properties: { query: { type: 'string' } } }
+          })
+      },
+      {
+        name: 'policy',
+        change: (config) => ({
+          ...config,
+          policies: { ...config.policies, default: { allowedModes: ['read', 'draft', 'dryRun'], denyDeprecatedTools: true } }
+        })
+      },
+      {
+        name: 'version',
+        change: (config) => withSearchTool(config, { version: '2026-05-10.2' })
+      }
+    ];
+
+    for (const item of cases) {
+      const config = await testConfig();
+      const firstApp = createGatewayServer(config);
+      const first = await firstApp.inject({
+        method: 'POST',
+        url: '/v1/tools/admin.searchUsers/call',
+        headers: agentHeaders(),
+        payload: { idempotencyKey: `fingerprint-${item.name}`, input: { query: 'ada' } }
+      });
+      expect(first.statusCode).toBe(200);
+
+      const secondApp = createGatewayServer(item.change(config));
+      const second = await secondApp.inject({
+        method: 'POST',
+        url: '/v1/tools/admin.searchUsers/call',
+        headers: agentHeaders(),
+        payload: { idempotencyKey: `fingerprint-${item.name}`, input: { query: 'ada' } }
+      });
+      expect(second.statusCode).toBe(400);
+      expect(second.json().error.code).toBe('IDEMPOTENCY_CONFLICT');
+    }
+  });
+
+  it('does not replay legacy policyHash-only idempotency records', async () => {
+    const config = await testConfig();
+    const stateDir = join(config.configDir, '.tool-boundary');
+    await mkdir(stateDir, { recursive: true });
+    await writeFile(
+      join(stateDir, 'idempotency.json'),
+      JSON.stringify({
+        records: [
+          {
+            toolName: 'admin.searchUsers',
+            key: 'legacy-policy-hash-key',
+            inputHash: hashUnknown({ hasInput: true, input: { query: 'ada' } }),
+            principalName: 'local-agent',
+            policyHash: 'legacy-policy-hash',
+            result: { executionId: 'exec-legacy', output: { users: [] }, policyHash: 'legacy-policy-hash' },
+            createdAt: new Date().toISOString()
+          }
+        ]
+      })
+    );
+    const app = createGatewayServer(config);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/tools/admin.searchUsers/call',
+      headers: agentHeaders(),
+      payload: { idempotencyKey: 'legacy-policy-hash-key', input: { query: 'ada' } }
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.code).toBe('IDEMPOTENCY_CONFLICT');
+  });
+
   it('keeps missing input distinct from empty object for idempotency hashing', async () => {
     const app = createGatewayServer(await testConfig());
     const first = await app.inject({
@@ -419,6 +563,21 @@ describe('gateway', () => {
     expect(response.json().error).toMatchObject({ code: 'CONFIG_INVALID' });
   });
 });
+
+function withSearchTool(config: LoadedConfig, patch: Partial<ToolDefinition>): LoadedConfig {
+  const current = config.tools['admin.searchUsers'];
+  if (current === undefined) throw new Error('Missing admin.searchUsers test tool');
+  return {
+    ...config,
+    tools: {
+      ...config.tools,
+      'admin.searchUsers': {
+        ...current,
+        ...patch
+      } as ToolDefinition
+    }
+  };
+}
 
 async function testConfig(): Promise<LoadedConfig> {
   const dir = await mkdtemp(join(tmpdir(), 'tool-boundary-gateway-'));

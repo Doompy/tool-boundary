@@ -8,7 +8,7 @@ import {
   type CreateApprovalInput
 } from './approval.js';
 import { ToolBoundaryError } from './errors.js';
-import type { ApprovalRecord, AuditEvent, StoredToolCallResult } from './types.js';
+import type { ApprovalRecord, AuditEvent, AuditQuery, AuditQueryResult, StoredToolCallResult } from './types.js';
 
 type ApprovalFile = {
   readonly records: readonly ApprovalRecord[];
@@ -19,7 +19,7 @@ type IdempotencyRecord = {
   readonly key: string;
   readonly inputHash: string;
   readonly principalName: string;
-  readonly policyHash: string;
+  readonly executionFingerprint?: string;
   readonly result: StoredToolCallResult;
   readonly createdAt: string;
 };
@@ -31,9 +31,11 @@ type IdempotencyFile = {
 export interface AuditSink {
   write(event: AuditEvent): Promise<void>;
   readAll(): Promise<readonly AuditEvent[]>;
+  query(filter: AuditQuery): Promise<AuditQueryResult>;
 }
 
 export interface ApprovalStore {
+  get(id: string): Promise<ApprovalRecord | undefined>;
   list(): Promise<readonly ApprovalRecord[]>;
   expireDue(now?: Date): Promise<readonly ApprovalRecord[]>;
   create(input: CreateApprovalInput): Promise<ApprovalRecord>;
@@ -49,13 +51,13 @@ export type IdempotencyCheckResult =
   | { readonly status: 'conflict' };
 
 export interface IdempotencyStore {
-  check(toolName: string, key: string, inputHash: string, principalName: string, policyHash: string): Promise<IdempotencyCheckResult>;
+  check(toolName: string, key: string, inputHash: string, principalName: string, executionFingerprint: string): Promise<IdempotencyCheckResult>;
   record(
     toolName: string,
     key: string,
     inputHash: string,
     principalName: string,
-    policyHash: string,
+    executionFingerprint: string,
     result: StoredToolCallResult
   ): Promise<void>;
 }
@@ -84,6 +86,23 @@ export class JsonlAuditSink implements AuditSink {
       throw error;
     }
   }
+
+  async query(filter: AuditQuery): Promise<AuditQueryResult> {
+    const limit = filter.limit ?? Number.POSITIVE_INFINITY;
+    const filtered = (await this.readAll()).filter((event) => {
+      if (filter.toolName !== undefined && event.toolName !== filter.toolName) return false;
+      if (filter.eventType !== undefined && event.eventType !== filter.eventType) return false;
+      return true;
+    });
+    const afterIndex = filter.after === undefined ? -1 : filtered.findIndex((event) => event.id === filter.after);
+    const start = afterIndex === -1 ? 0 : afterIndex + 1;
+    const page = filtered.slice(start, start + limit);
+    const next = filtered[start + limit];
+    return {
+      events: page,
+      nextCursor: next === undefined ? undefined : page.at(-1)?.id
+    };
+  }
 }
 
 export class FileApprovalStore implements ApprovalStore {
@@ -91,6 +110,10 @@ export class FileApprovalStore implements ApprovalStore {
 
   constructor(path: string) {
     this.path = path;
+  }
+
+  async get(id: string): Promise<ApprovalRecord | undefined> {
+    return (await this.read()).records.find((record) => record.id === id);
   }
 
   async list(): Promise<readonly ApprovalRecord[]> {
@@ -150,6 +173,9 @@ export class FileApprovalStore implements ApprovalStore {
         details: { approvalTokenHash: tokenHash },
         publicDetails: {}
       });
+    }
+    if (record.status === 'expired') {
+      throw approvalExpiredError(record, tokenHash);
     }
     if (record.status === 'consumed') {
       throw new ToolBoundaryError('APPROVAL_ALREADY_CONSUMED', 'Approval token has already been consumed', {
@@ -259,7 +285,7 @@ export class FileIdempotencyStore implements IdempotencyStore {
     key: string,
     inputHash: string,
     principalName: string,
-    policyHash: string
+    executionFingerprint: string
   ): Promise<IdempotencyCheckResult> {
     const file = await this.read();
     const record = file.records.find(
@@ -267,7 +293,7 @@ export class FileIdempotencyStore implements IdempotencyStore {
     );
     if (record === undefined) return { status: 'miss' };
     if (record.inputHash !== inputHash) return { status: 'conflict' };
-    if (record.policyHash !== policyHash) return { status: 'conflict' };
+    if (record.executionFingerprint !== executionFingerprint) return { status: 'conflict' };
     return { status: 'replay', result: record.result };
   }
 
@@ -276,7 +302,7 @@ export class FileIdempotencyStore implements IdempotencyStore {
     key: string,
     inputHash: string,
     principalName: string,
-    policyHash: string,
+    executionFingerprint: string,
     result: StoredToolCallResult
   ): Promise<void> {
     const file = await this.read();
@@ -286,8 +312,8 @@ export class FileIdempotencyStore implements IdempotencyStore {
       key,
       inputHash,
       principalName,
-      policyHash,
-      result: { ...result, policyHash },
+      executionFingerprint,
+      result: { ...result, executionFingerprint },
       createdAt: new Date().toISOString()
     });
     await this.write({ records });
@@ -333,14 +359,17 @@ function isExpirable(record: ApprovalRecord): boolean {
   return record.status === 'requested' || record.status === 'approved';
 }
 
-function approvalExpiredError(record: ApprovalRecord): ToolBoundaryError {
+function approvalExpiredError(record: ApprovalRecord, approvalTokenHash = record.approvalTokenHash): ToolBoundaryError {
   return new ToolBoundaryError('APPROVAL_EXPIRED', 'Approval is expired', {
-    details: { approvalId: record.id, toolName: record.toolName, approvalTokenHash: record.approvalTokenHash },
+    details: { approvalId: record.id, toolName: record.toolName, approvalTokenHash },
     publicDetails: { approvalId: record.id }
   });
 }
 
 function throwIfExpired(record: ApprovalRecord, now: Date): void {
+  if (record.status === 'expired') {
+    throw approvalExpiredError(record);
+  }
   if (isExpirable(record) && approvalIsExpired(record, now)) {
     throw approvalExpiredError(record);
   }

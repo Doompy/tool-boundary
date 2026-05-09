@@ -43,6 +43,7 @@ const mockTargetSchema = z.object({
 });
 
 export const rawToolDefinitionSchema = z.object({
+  version: z.string().optional(),
   description: z.string().optional(),
   mode: toolModeSchema,
   riskLevel: riskLevelSchema.optional(),

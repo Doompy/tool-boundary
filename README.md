@@ -11,6 +11,7 @@ Instead of wiring policy, approval, audit, redaction, and idempotency into every
 - HTTP POST upstream tools.
 - Deterministic policy checks.
 - Minimal JSON Schema subset validation for input schemas: `type`, `required`, and `properties`.
+- Output schemas are registry documentation placeholders in MVP; upstream responses are not runtime-validated yet.
 - Local approval queue.
 - JSONL audit sink.
 - Audit redaction, hashing, and structural summaries.
@@ -62,8 +63,10 @@ node packages/cli/dist/index.js serve --config ./tool-boundary.config.yaml
 - Default policy allows only `read`, `draft`, and `dryRun`.
 - Mutating calls can require approval and idempotency keys.
 - Idempotency keys are scoped per authenticated principal; another principal using the same key gets an independent execution.
+- Idempotency replay is also bound to an execution fingerprint of the tool version, target, input schema, and policy. Bump `tool.version` when upstream semantics change intentionally.
 - Agent and operator tokens should use separate scopes: agents call tools and request approvals, while operators approve/reject and read audit.
 - Output summaries are structural and do not serialize full objects by default.
+- Audit reads support `limit`, `after`, `toolName`, and `eventType` query parameters for local tailing and review.
 - Local JSON file stores are intended for MVP/local development. Production storage should inject custom store implementations through the gateway store interfaces.
 
 ## Local Demo

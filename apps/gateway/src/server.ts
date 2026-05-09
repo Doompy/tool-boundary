@@ -17,6 +17,7 @@ import {
   toToolBoundaryError,
   type ApprovalRecord,
   type ApprovalStore,
+  type AuditEventType,
   type AuditSink,
   type AuditPayloadPolicy,
   type IdempotencyStore,
@@ -33,6 +34,20 @@ type Principal = {
   readonly name: string;
   readonly scopes: readonly string[];
 };
+
+const auditEventTypes: readonly AuditEventType[] = [
+  'tool_call_started',
+  'tool_call_allowed',
+  'tool_call_denied',
+  'approval_required',
+  'tool_call_succeeded',
+  'tool_call_failed',
+  'approval_requested',
+  'approval_approved',
+  'approval_rejected',
+  'approval_consumed',
+  'approval_expired'
+];
 
 export type GatewayServerOptions = {
   readonly logger?: boolean;
@@ -71,7 +86,7 @@ export function createGatewayServer(config: LoadedConfig, options: GatewayServer
     const body = parseToolCallRequest(request.body);
     const auditPolicy = resolveAuditPolicy(config, tool);
     const policy = resolvePolicy(config, tool);
-    const policyHash = policyHashForToolCall(tool, policy);
+    const executionFingerprint = executionFingerprintForToolCall(tool, policy);
     const executionId = randomUUID();
     const input = body.input;
     const inputHash = inputHashForToolCall(body);
@@ -110,7 +125,7 @@ export function createGatewayServer(config: LoadedConfig, options: GatewayServer
     }
 
     if (body.idempotencyKey !== undefined) {
-      const idempotency = await idempotencyStore.check(tool.name, body.idempotencyKey, inputHash, principal.name, policyHash);
+      const idempotency = await idempotencyStore.check(tool.name, body.idempotencyKey, inputHash, principal.name, executionFingerprint);
       if (idempotency.status === 'conflict') {
         await writeDeniedAudit(auditSink, tool, executionId, principal, input, auditPolicy, {
           verdict: 'deny',
@@ -270,7 +285,7 @@ export function createGatewayServer(config: LoadedConfig, options: GatewayServer
     try {
       const output = await executeToolTarget(tool, input);
       if (body.idempotencyKey !== undefined) {
-        await idempotencyStore.record(tool.name, body.idempotencyKey, inputHash, principal.name, policyHash, { executionId, output, approvalId: approval?.id });
+        await idempotencyStore.record(tool.name, body.idempotencyKey, inputHash, principal.name, executionFingerprint, { executionId, output, approvalId: approval?.id });
       }
       await auditSink.write(
         buildAuditEvent({
@@ -312,10 +327,7 @@ export function createGatewayServer(config: LoadedConfig, options: GatewayServer
 
   app.get('/v1/approvals', async (request, reply) => {
     const principal = authenticate(request, config, 'approvals:read');
-    const expired = await approvalStore.expireDue();
-    for (const record of expired) {
-      await writeApprovalExpiredAudit(config, auditSink, principal, record);
-    }
+    await expireDueAndAudit(config, approvalStore, auditSink, principal);
     await reply.send({ approvals: (await approvalStore.list()).map(publicApprovalRecord) });
   });
 
@@ -352,8 +364,9 @@ export function createGatewayServer(config: LoadedConfig, options: GatewayServer
   app.post('/v1/approvals/:id/approve', async (request, reply) => {
     const principal = authenticate(request, config, 'approvals:approve');
     const approvalId = getIdParam(request);
-    const requested = (await approvalStore.list()).find((record) => record.id === approvalId);
-    if (requested !== undefined && requested.requestedBy === principal.name) {
+    const expiredIds = await expireDueAndAudit(config, approvalStore, auditSink, principal);
+    const requested = await approvalStore.get(approvalId);
+    if (requested !== undefined && requested.status === 'requested' && requested.requestedBy === principal.name) {
       throw new ToolBoundaryError('FORBIDDEN', 'Approval requester cannot approve the same approval');
     }
     let record: ApprovalRecord;
@@ -363,7 +376,10 @@ export function createGatewayServer(config: LoadedConfig, options: GatewayServer
     } catch (error) {
       const normalized = toToolBoundaryError(error);
       if (normalized.code === 'APPROVAL_EXPIRED') {
-        await writeApprovalExpiredAuditFromError(config, auditSink, principal, normalized);
+        const expiredApprovalId = getApprovalIdFromDetails(normalized.details);
+        if (expiredApprovalId === undefined || !expiredIds.has(expiredApprovalId)) {
+          await writeApprovalExpiredAuditFromError(config, auditSink, principal, normalized);
+        }
       }
       return sendError(reply, normalized);
     }
@@ -408,7 +424,7 @@ export function createGatewayServer(config: LoadedConfig, options: GatewayServer
 
   app.get('/v1/audit', async (request, reply) => {
     authenticate(request, config, 'audit:read');
-    await reply.send({ events: await auditSink.readAll() });
+    await reply.send(await auditSink.query(parseAuditQuery(request.query)));
   });
 
   app.setErrorHandler(async (error, _request, reply) => {
@@ -547,6 +563,40 @@ function parseApprovalCreateBody(body: unknown): {
   };
 }
 
+function parseAuditQuery(query: unknown): {
+  readonly limit: number;
+  readonly after?: string;
+  readonly toolName?: string;
+  readonly eventType?: AuditEventType;
+} {
+  const value = isRecord(query) ? query : {};
+  const limit = parseLimit(value.limit);
+  const eventType = parseAuditEventType(value.eventType);
+  return {
+    limit,
+    after: typeof value.after === 'string' && value.after.length > 0 ? value.after : undefined,
+    toolName: typeof value.toolName === 'string' && value.toolName.length > 0 ? value.toolName : undefined,
+    eventType
+  };
+}
+
+function parseLimit(value: unknown): number {
+  if (value === undefined) return 100;
+  const parsed = typeof value === 'string' ? Number(value) : value;
+  if (!Number.isInteger(parsed) || typeof parsed !== 'number' || parsed < 1) {
+    throw new ToolBoundaryError('CONFIG_INVALID', 'Audit limit must be a positive integer');
+  }
+  return Math.min(parsed, 1000);
+}
+
+function parseAuditEventType(value: unknown): AuditEventType | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || !auditEventTypes.includes(value as AuditEventType)) {
+    throw new ToolBoundaryError('CONFIG_INVALID', 'Audit eventType is invalid');
+  }
+  return value as AuditEventType;
+}
+
 function inputHashForToolCall(body: ToolCallRequest): string {
   return hashUnknown(body.hasInput === true ? { hasInput: true, input: body.input } : { hasInput: false });
 }
@@ -645,6 +695,14 @@ async function writeApprovalExpiredAudit(config: LoadedConfig, auditSink: AuditS
   );
 }
 
+async function expireDueAndAudit(config: LoadedConfig, approvalStore: ApprovalStore, auditSink: AuditSink, principal: Principal): Promise<ReadonlySet<string>> {
+  const expired = await approvalStore.expireDue();
+  for (const record of expired) {
+    await writeApprovalExpiredAudit(config, auditSink, principal, record);
+  }
+  return new Set(expired.map((record) => record.id));
+}
+
 async function writeApprovalExpiredAuditFromError(
   config: LoadedConfig,
   auditSink: AuditSink,
@@ -676,13 +734,16 @@ function getApprovalTokenHashFromDetails(details: unknown): string | undefined {
   return isRecord(details) && typeof details.approvalTokenHash === 'string' ? details.approvalTokenHash : undefined;
 }
 
-function policyHashForToolCall(tool: ToolDefinition, policy: ToolPolicyDefinition): string {
+function executionFingerprintForToolCall(tool: ToolDefinition, policy: ToolPolicyDefinition): string {
   return hashUnknown({
     toolName: tool.name,
+    version: tool.version,
     mode: tool.mode,
     riskLevel: tool.riskLevel,
     approvalRequired: tool.approvalRequired,
     idempotency: tool.idempotency,
-    policy
+    policy,
+    target: tool.target,
+    inputSchema: tool.inputSchema
   });
 }

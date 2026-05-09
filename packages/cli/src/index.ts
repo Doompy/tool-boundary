@@ -205,6 +205,7 @@ policies:
 
 tools:
   admin.searchUsers:
+    version: "2026-05-10.1"
     mode: read
     riskLevel: low
     description: Search users by query and status.
@@ -222,6 +223,7 @@ tools:
       error: summary
 
   admin.disableUser:
+    version: "2026-05-10.1"
     mode: mutate
     riskLevel: high
     approvalRequired: true

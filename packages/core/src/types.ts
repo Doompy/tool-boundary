@@ -38,6 +38,7 @@ export type ToolApprovalPolicy = {
 
 export type ToolDefinition = {
   readonly name: string;
+  readonly version?: string;
   readonly description?: string;
   readonly mode: ToolMode;
   readonly riskLevel?: ToolRiskLevel;
@@ -146,9 +147,21 @@ export type AuditEvent = {
   readonly createdAt: string;
 };
 
+export type AuditQuery = {
+  readonly limit?: number;
+  readonly after?: string;
+  readonly toolName?: string;
+  readonly eventType?: AuditEventType;
+};
+
+export type AuditQueryResult = {
+  readonly events: readonly AuditEvent[];
+  readonly nextCursor?: string;
+};
+
 export type StoredToolCallResult = {
   readonly executionId: string;
   readonly output: unknown;
   readonly approvalId?: string;
-  readonly policyHash?: string;
+  readonly executionFingerprint?: string;
 };
